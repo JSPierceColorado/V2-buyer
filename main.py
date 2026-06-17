@@ -352,10 +352,15 @@ def open_worksheet(gc: gspread.Client, cfg: Config) -> gspread.Worksheet:
 
 
 def score_matches(value: Any, target: float) -> bool:
+    """Return True when the row score meets or exceeds BUY_SCORE.
+
+    Example: if BUY_SCORE=99.5, scores 99.5, 99.6, and 100 match.
+    Blank/non-numeric scores do not match.
+    """
     score = to_float(value, default=math.nan)
     if math.isnan(score):
         return False
-    return abs(score - target) < 1e-9
+    return score >= target
 
 
 def read_buy_candidates(ws: gspread.Worksheet, cfg: Config) -> List[str]:
