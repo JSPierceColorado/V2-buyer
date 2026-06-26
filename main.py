@@ -84,7 +84,7 @@ class Config:
     min_notional: float
     max_orders_per_cycle: int
     cycle_sleep_seconds: float
-    buy_power_fields: Tuple[str, ...]
+    regt_fallback_fraction: float
     extended_hours: bool
 
     # Chasing behavior
@@ -94,7 +94,6 @@ class Config:
     order_poll_interval_seconds: float
     treat_partial_fill_as_success: bool
     order_failure_cooldown_seconds: float
-    max_order_submit_failures_per_cycle: int
     error_body_max_chars: int
 
     # HTTP/retry behavior
@@ -155,16 +154,14 @@ def load_config() -> Config:
         "https://paper-api.alpaca.markets" if alpaca_paper else "https://api.alpaca.markets"
     )
 
-    fields_raw = os.getenv(
-        "BUYING_POWER_FIELDS",
-        "daytrading_buying_power,regt_buying_power,buying_power,cash,non_marginable_buying_power",
-    )
-    buy_power_fields = tuple(x.strip() for x in fields_raw.split(",") if x.strip())
-
     steps_raw = os.getenv("BID_TO_MARKET_STEPS", "0.0,0.4,0.7,1.0")
     steps = tuple(float(x.strip()) for x in steps_raw.split(",") if x.strip())
     if not steps:
         steps = (0.0, 0.4, 0.7, 1.0)
+
+    regt_fallback_fraction = getenv_float("REGT_FALLBACK_FRACTION", 0.95)
+    if regt_fallback_fraction <= 0:
+        raise RuntimeError("REGT_FALLBACK_FRACTION must be greater than 0")
 
     return Config(
         google_service_account_json=google_service_account_json,
@@ -185,7 +182,7 @@ def load_config() -> Config:
         min_notional=getenv_float("MIN_NOTIONAL", 1.0),
         max_orders_per_cycle=getenv_int("MAX_ORDERS_PER_CYCLE", 0),
         cycle_sleep_seconds=getenv_float("CYCLE_SLEEP_SECONDS", 10.0),
-        buy_power_fields=buy_power_fields,
+        regt_fallback_fraction=regt_fallback_fraction,
         extended_hours=getenv_bool("EXTENDED_HOURS", False),
         bid_to_market_steps=steps,
         step_timeout_seconds=getenv_float("STEP_TIMEOUT_SECONDS", 5.0),
@@ -193,7 +190,6 @@ def load_config() -> Config:
         order_poll_interval_seconds=getenv_float("ORDER_POLL_INTERVAL_SECONDS", 2.0),
         treat_partial_fill_as_success=getenv_bool("TREAT_PARTIAL_FILL_AS_SUCCESS", True),
         order_failure_cooldown_seconds=getenv_float("ORDER_FAILURE_COOLDOWN_SECONDS", 1800.0),
-        max_order_submit_failures_per_cycle=getenv_int("MAX_ORDER_SUBMIT_FAILURES_PER_CYCLE", 5),
         error_body_max_chars=getenv_int("ERROR_BODY_MAX_CHARS", 800),
         request_timeout_seconds=getenv_float("REQUEST_TIMEOUT_SECONDS", 10.0),
         request_retries=getenv_int("REQUEST_RETRIES", 3),
@@ -441,12 +437,23 @@ def get_account(session: requests.Session, cfg: Config) -> Dict[str, Any]:
     return http_get(session, f"{cfg.trading_base_url}/v2/account", cfg)
 
 
-def choose_buying_power(account: Dict[str, Any], cfg: Config) -> Tuple[str, float]:
-    for field in cfg.buy_power_fields:
-        value = to_float(account.get(field), default=0.0)
-        if value > 0:
-            return field, value
-    return "", 0.0
+def choose_buying_power(account: Dict[str, Any]) -> Tuple[str, float]:
+    field = "buying_power"
+    return field, to_float(account.get(field), default=0.0)
+
+
+def regt_fallback_notional(account: Dict[str, Any], cfg: Config, primary_notional: float) -> Tuple[float, float]:
+    regt_buying_power = to_float(account.get("regt_buying_power"), default=0.0)
+    if regt_buying_power <= 0:
+        return 0.0, regt_buying_power
+    return min(primary_notional, round(regt_buying_power * cfg.regt_fallback_fraction, 2)), regt_buying_power
+
+
+def should_retry_with_regt(attempt: OrderAttemptResult) -> bool:
+    return (
+        attempt.failure_status == 403
+        and "insufficient regt buying power" in attempt.failure_message.lower()
+    )
 
 
 def list_position_symbols(session: requests.Session, cfg: Config) -> Set[str]:
@@ -719,7 +726,6 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, cfg: Config)
     skipped_notional = 0
     skipped_recent_failures = 0
     order_submit_failures = 0
-    consecutive_order_submit_failures = 0
 
     for symbol in candidates:
         if _stop_event.is_set():
@@ -741,9 +747,9 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, cfg: Config)
             continue
 
         account = get_account(session, cfg)
-        bp_field, buying_power = choose_buying_power(account, cfg)
+        bp_field, buying_power = choose_buying_power(account)
         if buying_power <= 0:
-            log.warning("No positive buying power found in fields=%s; stopping this cycle", cfg.buy_power_fields)
+            log.warning("No positive buying_power found; stopping this cycle")
             break
 
         notional = round(buying_power * cfg.order_fraction, 2)
@@ -770,15 +776,38 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, cfg: Config)
         attempt = place_best_bid_chasing_order(session, cfg, symbol, notional)
         if attempt.submitted:
             orders_submitted += 1
+
+        if not attempt.filled_or_partial and should_retry_with_regt(attempt):
+            fallback_notional, regt_buying_power = regt_fallback_notional(account, cfg, notional)
+            if fallback_notional >= cfg.min_notional and fallback_notional < notional:
+                log.info(
+                    "Retrying %s with Reg-T fallback notional=%.2f original_notional=%.2f regt_buying_power=%.2f fallback_fraction=%.2f",
+                    symbol,
+                    fallback_notional,
+                    notional,
+                    regt_buying_power,
+                    cfg.regt_fallback_fraction,
+                )
+                attempt = place_best_bid_chasing_order(session, cfg, symbol, fallback_notional)
+                if attempt.submitted:
+                    orders_submitted += 1
+            else:
+                log.warning(
+                    "No usable Reg-T fallback for %s fallback_notional=%.2f original_notional=%.2f regt_buying_power=%.2f min_notional=%.2f",
+                    symbol,
+                    fallback_notional,
+                    notional,
+                    regt_buying_power,
+                    cfg.min_notional,
+                )
+
         if attempt.filled_or_partial:
             filled_or_partial += 1
-            consecutive_order_submit_failures = 0
             # Keep in-memory duplicate protection current inside this same cycle.
             positions.add(symbol)
         else:
             if attempt.failure_message:
                 order_submit_failures += 1
-                consecutive_order_submit_failures += 1
                 remember_order_failure(symbol, cfg, attempt.failure_message)
                 log.warning(
                     "Order failure cooldown set for %s seconds=%.0f status=%s reason=%s",
@@ -792,16 +821,6 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, cfg: Config)
                 open_buy_orders = list_open_buy_order_symbols(session, cfg)
             except Exception as exc:
                 log.warning("Could not refresh open buy orders after failed attempt for %s: %s", symbol, exc)
-
-        if (
-            cfg.max_order_submit_failures_per_cycle > 0
-            and consecutive_order_submit_failures >= cfg.max_order_submit_failures_per_cycle
-        ):
-            log.warning(
-                "MAX_ORDER_SUBMIT_FAILURES_PER_CYCLE=%d consecutive failures reached; ending cycle",
-                cfg.max_order_submit_failures_per_cycle,
-            )
-            break
 
         if cfg.max_orders_per_cycle > 0 and orders_submitted >= cfg.max_orders_per_cycle:
             log.info("MAX_ORDERS_PER_CYCLE=%d reached; ending cycle", cfg.max_orders_per_cycle)
@@ -833,19 +852,18 @@ def buyer_loop() -> None:
     cfg = load_config()
     set_state(started_at=now_iso())
     log.info(
-        "Buyer service started sheet_id=%s worksheet=%s range=%s buy_score=%s order_fraction=%.4f paper=%s bp_fields=%s steps=%s cycle_sleep=%.1f extended_hours=%s order_failure_cooldown=%.0f max_order_submit_failures_per_cycle=%d",
+        "Buyer service started sheet_id=%s worksheet=%s range=%s buy_score=%s order_fraction=%.4f paper=%s primary_buying_power_field=buying_power regt_fallback_fraction=%.2f steps=%s cycle_sleep=%.1f extended_hours=%s order_failure_cooldown=%.0f",
         cfg.google_sheet_id,
         cfg.google_worksheet_name,
         cfg.screener_range,
         cfg.buy_score,
         cfg.order_fraction,
         cfg.alpaca_paper,
-        ",".join(cfg.buy_power_fields),
+        cfg.regt_fallback_fraction,
         cfg.bid_to_market_steps,
         cfg.cycle_sleep_seconds,
         cfg.extended_hours,
         cfg.order_failure_cooldown_seconds,
-        cfg.max_order_submit_failures_per_cycle,
     )
 
     gc: Optional[gspread.Client] = None
