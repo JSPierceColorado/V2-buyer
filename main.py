@@ -93,6 +93,9 @@ class Config:
     total_chase_timeout_seconds: float
     order_poll_interval_seconds: float
     treat_partial_fill_as_success: bool
+    order_failure_cooldown_seconds: float
+    max_order_submit_failures_per_cycle: int
+    error_body_max_chars: int
 
     # HTTP/retry behavior
     request_timeout_seconds: float
@@ -101,6 +104,24 @@ class Config:
     rate_limit_sleep_seconds: float
     error_sleep_seconds: float
 
+
+
+@dataclass(frozen=True)
+class OrderAttemptResult:
+    filled_or_partial: bool
+    submitted: bool
+    failure_status: Optional[int] = None
+    failure_message: str = ""
+
+
+class HttpStatusError(RuntimeError):
+    def __init__(self, method: str, url: str, status_code: int, body: str) -> None:
+        self.method = method
+        self.url = url
+        self.status_code = status_code
+        self.body = body
+        body_suffix = f" body={body}" if body else ""
+        super().__init__(f"{method} {url} failed status={status_code}{body_suffix}")
 
 
 def load_config() -> Config:
@@ -171,6 +192,9 @@ def load_config() -> Config:
         total_chase_timeout_seconds=getenv_float("TOTAL_CHASE_TIMEOUT_SECONDS", 30.0),
         order_poll_interval_seconds=getenv_float("ORDER_POLL_INTERVAL_SECONDS", 2.0),
         treat_partial_fill_as_success=getenv_bool("TREAT_PARTIAL_FILL_AS_SUCCESS", True),
+        order_failure_cooldown_seconds=getenv_float("ORDER_FAILURE_COOLDOWN_SECONDS", 1800.0),
+        max_order_submit_failures_per_cycle=getenv_int("MAX_ORDER_SUBMIT_FAILURES_PER_CYCLE", 5),
+        error_body_max_chars=getenv_int("ERROR_BODY_MAX_CHARS", 800),
         request_timeout_seconds=getenv_float("REQUEST_TIMEOUT_SECONDS", 10.0),
         request_retries=getenv_int("REQUEST_RETRIES", 3),
         request_sleep_seconds=getenv_float("REQUEST_SLEEP_SECONDS", 0.25),
@@ -197,7 +221,10 @@ _state: Dict[str, Any] = {
     "last_orders_filled_or_partial": 0,
     "last_skipped_existing": 0,
     "last_skipped_notional": 0,
+    "last_skipped_recent_failures": 0,
+    "last_order_submit_failures": 0,
 }
+_order_failure_cooldowns: Dict[str, Tuple[float, str]] = {}
 
 
 # -----------------------------
@@ -257,6 +284,21 @@ def request_headers(cfg: Config) -> Dict[str, str]:
     }
 
 
+def response_body_for_log(resp: requests.Response, cfg: Config) -> str:
+    body = (resp.text or "").strip().replace("\n", " ")
+    max_chars = max(0, cfg.error_body_max_chars)
+    if max_chars <= 0:
+        return ""
+    if len(body) > max_chars:
+        return body[:max_chars] + "...[truncated]"
+    return body
+
+
+def raise_for_status_with_body(resp: requests.Response, cfg: Config, method: str, url: str) -> None:
+    if resp.status_code >= 400:
+        raise HttpStatusError(method, url, resp.status_code, response_body_for_log(resp, cfg))
+
+
 def sleep_if_configured(seconds: float) -> None:
     if seconds > 0:
         time.sleep(seconds)
@@ -278,21 +320,21 @@ def http_get(session: requests.Session, url: str, cfg: Config, *, params: Option
                 timeout=cfg.request_timeout_seconds,
             )
             if resp.status_code == 429:
-                msg = f"rate limited status 429: {resp.text}"
+                msg = f"rate limited status 429: {response_body_for_log(resp, cfg)}"
                 if attempt < cfg.request_retries:
                     log.warning("GET rate limited attempt=%s url=%s err=%s; retrying in %.1fs", attempt, url, msg, cfg.rate_limit_sleep_seconds)
                     time.sleep(cfg.rate_limit_sleep_seconds)
                     continue
                 raise RuntimeError(msg)
             if 500 <= resp.status_code < 600:
-                msg = f"retryable status {resp.status_code}: {resp.text}"
+                msg = f"retryable status {resp.status_code}: {response_body_for_log(resp, cfg)}"
                 if attempt < cfg.request_retries:
                     backoff = min(2 ** attempt, 30)
                     log.warning("GET failed attempt=%s url=%s err=%s; retrying in %.1fs", attempt, url, msg, backoff)
                     time.sleep(backoff)
                     continue
                 raise RuntimeError(msg)
-            resp.raise_for_status()
+            raise_for_status_with_body(resp, cfg, "GET", url)
             sleep_if_configured(cfg.request_sleep_seconds)
             return resp.json() if resp.text else None
         except Exception as exc:
@@ -314,8 +356,8 @@ def http_post_once(session: requests.Session, url: str, cfg: Config, *, payload:
         timeout=cfg.request_timeout_seconds,
     )
     if resp.status_code == 429:
-        raise RuntimeError(f"rate limited status 429: {resp.text}")
-    resp.raise_for_status()
+        raise HttpStatusError("POST", url, resp.status_code, response_body_for_log(resp, cfg))
+    raise_for_status_with_body(resp, cfg, "POST", url)
     sleep_if_configured(cfg.request_sleep_seconds)
     return resp.json() if resp.text else None
 
@@ -324,9 +366,9 @@ def http_delete_once(session: requests.Session, url: str, cfg: Config) -> Option
     resp = session.delete(url, headers=request_headers(cfg), timeout=cfg.request_timeout_seconds)
     if resp.status_code in {404, 422}:
         # The order may already be filled/canceled; caller will re-check if needed.
-        log.info("DELETE returned status=%s url=%s body=%s", resp.status_code, url, resp.text)
+        log.info("DELETE returned status=%s url=%s body=%s", resp.status_code, url, response_body_for_log(resp, cfg))
         return None
-    resp.raise_for_status()
+    raise_for_status_with_body(resp, cfg, "DELETE", url)
     sleep_if_configured(cfg.request_sleep_seconds)
     return resp.json() if resp.text else None
 
@@ -433,6 +475,23 @@ def list_open_buy_order_symbols(session: requests.Session, cfg: Config) -> Set[s
     return result
 
 
+def cooldown_reason(symbol: str) -> Optional[str]:
+    entry = _order_failure_cooldowns.get(symbol)
+    if not entry:
+        return None
+    blocked_until, reason = entry
+    if time.time() >= blocked_until:
+        _order_failure_cooldowns.pop(symbol, None)
+        return None
+    return reason
+
+
+def remember_order_failure(symbol: str, cfg: Config, reason: str) -> None:
+    if cfg.order_failure_cooldown_seconds <= 0:
+        return
+    _order_failure_cooldowns[symbol] = (time.time() + cfg.order_failure_cooldown_seconds, reason)
+
+
 def get_snapshot(session: requests.Session, cfg: Config, symbol: str) -> Dict[str, Any]:
     params = {"feed": cfg.alpaca_data_feed} if cfg.alpaca_data_feed else None
     return http_get(session, f"{cfg.data_base_url}/v2/stocks/{symbol}/snapshot", cfg, params=params)
@@ -531,8 +590,8 @@ def maybe_cancel_live_order(session: requests.Session, cfg: Config, order_id: Op
         log.warning("Failed to cancel order %s for %s reason=%s err=%s", order_id, symbol, reason, exc)
 
 
-def place_best_bid_chasing_order(session: requests.Session, cfg: Config, symbol: str, notional: float) -> bool:
-    """Return True if filled, or partial-filled when TREAT_PARTIAL_FILL_AS_SUCCESS=true."""
+def place_best_bid_chasing_order(session: requests.Session, cfg: Config, symbol: str, notional: float) -> OrderAttemptResult:
+    """Submit/chase a buy order and report whether Alpaca accepted or filled it."""
     started = time.time()
     last_order_id: Optional[str] = None
 
@@ -548,11 +607,11 @@ def place_best_bid_chasing_order(session: requests.Session, cfg: Config, symbol:
                 status = order_status(order)
                 if status == "filled":
                     log.info("Previous order %s for %s filled while chasing", last_order_id, symbol)
-                    return True
+                    return OrderAttemptResult(filled_or_partial=True, submitted=True)
                 if status == "partially_filled" and cfg.treat_partial_fill_as_success:
                     maybe_cancel_live_order(session, cfg, last_order_id, symbol, "partial fill accepted")
                     log.info("Previous order %s for %s partially filled; accepting partial and stopping chase", last_order_id, symbol)
-                    return True
+                    return OrderAttemptResult(filled_or_partial=True, submitted=True)
                 if status not in {"canceled", "rejected", "expired", "done_for_day"}:
                     cancel_order(session, cfg, last_order_id)
                     log.info("Canceled previous order %s for %s to reprice", last_order_id, symbol)
@@ -563,7 +622,7 @@ def place_best_bid_chasing_order(session: requests.Session, cfg: Config, symbol:
         limit_price = compute_limit_price(bid, ask, last, step_fraction)
         if limit_price <= 0:
             log.warning("Skipping %s step=%d: no usable bid/ask/last bid=%.4f ask=%.4f last=%.4f", symbol, idx, bid, ask, last)
-            return False
+            return OrderAttemptResult(filled_or_partial=False, submitted=False)
 
         log.info(
             "Step %d for %s: bid=%.4f ask=%.4f last=%.4f step_fraction=%.2f -> limit_price=%s",
@@ -578,14 +637,41 @@ def place_best_bid_chasing_order(session: requests.Session, cfg: Config, symbol:
 
         try:
             order = submit_limit_buy(session, cfg, symbol, notional, limit_price)
+        except HttpStatusError as exc:
+            log.error(
+                "Order submit failed for %s at %s on step %d status=%s err=%s",
+                symbol,
+                limit_price,
+                idx,
+                exc.status_code,
+                exc,
+            )
+            return OrderAttemptResult(
+                filled_or_partial=False,
+                submitted=True,
+                failure_status=exc.status_code,
+                failure_message=str(exc),
+            )
         except Exception as exc:
             log.exception("Order submit failed for %s at %s on step %d: %s", symbol, limit_price, idx, exc)
-            return False
+            return OrderAttemptResult(filled_or_partial=False, submitted=True, failure_message=str(exc))
+
+        if not isinstance(order, dict):
+            log.warning("Order response for %s on step %d was not an object; aborting chase response=%r", symbol, idx, order)
+            return OrderAttemptResult(
+                filled_or_partial=False,
+                submitted=True,
+                failure_message="order response was empty or not an object",
+            )
 
         last_order_id = order.get("id") or order.get("client_order_id")
         if not last_order_id:
             log.warning("Could not determine order id for %s on step %d; aborting chase", symbol, idx)
-            return False
+            return OrderAttemptResult(
+                filled_or_partial=False,
+                submitted=True,
+                failure_message="order response did not include id or client_order_id",
+            )
 
         step_deadline = time.time() + min(cfg.step_timeout_seconds, max(0.0, cfg.total_chase_timeout_seconds - (time.time() - started)))
         while time.time() < step_deadline:
@@ -595,11 +681,11 @@ def place_best_bid_chasing_order(session: requests.Session, cfg: Config, symbol:
                 if status == "filled":
                     avg = order.get("filled_avg_price") or limit_price
                     log.info("Order %s for %s filled avg_price=%s", last_order_id, symbol, avg)
-                    return True
+                    return OrderAttemptResult(filled_or_partial=True, submitted=True)
                 if status == "partially_filled" and cfg.treat_partial_fill_as_success:
                     maybe_cancel_live_order(session, cfg, last_order_id, symbol, "partial fill accepted")
                     log.info("Order %s for %s partially filled; accepting partial and stopping chase", last_order_id, symbol)
-                    return True
+                    return OrderAttemptResult(filled_or_partial=True, submitted=True)
                 if status in {"canceled", "rejected", "expired", "done_for_day"}:
                     log.info("Order %s for %s ended status=%s while waiting", last_order_id, symbol, status)
                     break
@@ -609,7 +695,7 @@ def place_best_bid_chasing_order(session: requests.Session, cfg: Config, symbol:
 
     maybe_cancel_live_order(session, cfg, last_order_id, symbol, "chase exit")
     log.warning("Giving up chasing BUY for %s after %.1fs", symbol, time.time() - started)
-    return False
+    return OrderAttemptResult(filled_or_partial=False, submitted=last_order_id is not None)
 
 
 # -----------------------------
@@ -631,10 +717,19 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, cfg: Config)
     filled_or_partial = 0
     skipped_existing = 0
     skipped_notional = 0
+    skipped_recent_failures = 0
+    order_submit_failures = 0
+    consecutive_order_submit_failures = 0
 
     for symbol in candidates:
         if _stop_event.is_set():
             break
+
+        recent_failure = cooldown_reason(symbol)
+        if recent_failure:
+            log.info("Skipping %s: recent order failure cooldown reason=%s", symbol, recent_failure)
+            skipped_recent_failures += 1
+            continue
 
         if symbol in positions:
             log.info("Skipping %s: already held in Alpaca account", symbol)
@@ -672,18 +767,41 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, cfg: Config)
             buying_power,
         )
 
-        placed = place_best_bid_chasing_order(session, cfg, symbol, notional)
-        orders_submitted += 1
-        if placed:
+        attempt = place_best_bid_chasing_order(session, cfg, symbol, notional)
+        if attempt.submitted:
+            orders_submitted += 1
+        if attempt.filled_or_partial:
             filled_or_partial += 1
+            consecutive_order_submit_failures = 0
             # Keep in-memory duplicate protection current inside this same cycle.
             positions.add(symbol)
         else:
+            if attempt.failure_message:
+                order_submit_failures += 1
+                consecutive_order_submit_failures += 1
+                remember_order_failure(symbol, cfg, attempt.failure_message)
+                log.warning(
+                    "Order failure cooldown set for %s seconds=%.0f status=%s reason=%s",
+                    symbol,
+                    cfg.order_failure_cooldown_seconds,
+                    attempt.failure_status,
+                    attempt.failure_message,
+                )
             # Refresh open buy orders in case an unknown outcome left one open.
             try:
                 open_buy_orders = list_open_buy_order_symbols(session, cfg)
             except Exception as exc:
                 log.warning("Could not refresh open buy orders after failed attempt for %s: %s", symbol, exc)
+
+        if (
+            cfg.max_order_submit_failures_per_cycle > 0
+            and consecutive_order_submit_failures >= cfg.max_order_submit_failures_per_cycle
+        ):
+            log.warning(
+                "MAX_ORDER_SUBMIT_FAILURES_PER_CYCLE=%d consecutive failures reached; ending cycle",
+                cfg.max_order_submit_failures_per_cycle,
+            )
+            break
 
         if cfg.max_orders_per_cycle > 0 and orders_submitted >= cfg.max_orders_per_cycle:
             log.info("MAX_ORDERS_PER_CYCLE=%d reached; ending cycle", cfg.max_orders_per_cycle)
@@ -696,14 +814,18 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, cfg: Config)
         last_orders_filled_or_partial=filled_or_partial,
         last_skipped_existing=skipped_existing,
         last_skipped_notional=skipped_notional,
+        last_skipped_recent_failures=skipped_recent_failures,
+        last_order_submit_failures=order_submit_failures,
     )
     log.info(
-        "Cycle complete candidates=%d orders_submitted=%d filled_or_partial=%d skipped_existing=%d skipped_notional=%d",
+        "Cycle complete candidates=%d orders_submitted=%d filled_or_partial=%d skipped_existing=%d skipped_notional=%d skipped_recent_failures=%d order_submit_failures=%d",
         len(candidates),
         orders_submitted,
         filled_or_partial,
         skipped_existing,
         skipped_notional,
+        skipped_recent_failures,
+        order_submit_failures,
     )
 
 
@@ -711,7 +833,7 @@ def buyer_loop() -> None:
     cfg = load_config()
     set_state(started_at=now_iso())
     log.info(
-        "Buyer service started sheet_id=%s worksheet=%s range=%s buy_score=%s order_fraction=%.4f paper=%s bp_fields=%s steps=%s cycle_sleep=%.1f extended_hours=%s",
+        "Buyer service started sheet_id=%s worksheet=%s range=%s buy_score=%s order_fraction=%.4f paper=%s bp_fields=%s steps=%s cycle_sleep=%.1f extended_hours=%s order_failure_cooldown=%.0f max_order_submit_failures_per_cycle=%d",
         cfg.google_sheet_id,
         cfg.google_worksheet_name,
         cfg.screener_range,
@@ -722,6 +844,8 @@ def buyer_loop() -> None:
         cfg.bid_to_market_steps,
         cfg.cycle_sleep_seconds,
         cfg.extended_hours,
+        cfg.order_failure_cooldown_seconds,
+        cfg.max_order_submit_failures_per_cycle,
     )
 
     gc: Optional[gspread.Client] = None
