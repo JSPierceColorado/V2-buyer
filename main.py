@@ -86,6 +86,8 @@ class Config:
     cycle_sleep_seconds: float
     regt_fallback_fraction: float
     extended_hours: bool
+    blocked_product_name_pattern: str
+    skip_when_asset_name_unavailable: bool
 
     # Chasing behavior
     bid_to_market_steps: Tuple[float, ...]
@@ -184,6 +186,11 @@ def load_config() -> Config:
         cycle_sleep_seconds=getenv_float("CYCLE_SLEEP_SECONDS", 10.0),
         regt_fallback_fraction=regt_fallback_fraction,
         extended_hours=getenv_bool("EXTENDED_HOURS", False),
+        blocked_product_name_pattern=os.getenv(
+            "BLOCK_PRODUCT_NAME_PATTERN",
+            r"\b(daily|inverse|2\s*x|3\s*x)\b",
+        ).strip(),
+        skip_when_asset_name_unavailable=getenv_bool("SKIP_WHEN_ASSET_NAME_UNAVAILABLE", True),
         bid_to_market_steps=steps,
         step_timeout_seconds=getenv_float("STEP_TIMEOUT_SECONDS", 5.0),
         total_chase_timeout_seconds=getenv_float("TOTAL_CHASE_TIMEOUT_SECONDS", 30.0),
@@ -218,6 +225,8 @@ _state: Dict[str, Any] = {
     "last_skipped_existing": 0,
     "last_skipped_notional": 0,
     "last_skipped_recent_failures": 0,
+    "last_skipped_product_name_block": 0,
+    "last_skipped_asset_lookup": 0,
     "last_order_submit_failures": 0,
 }
 _order_failure_cooldowns: Dict[str, Tuple[float, str]] = {}
@@ -499,6 +508,32 @@ def remember_order_failure(symbol: str, cfg: Config, reason: str) -> None:
     _order_failure_cooldowns[symbol] = (time.time() + cfg.order_failure_cooldown_seconds, reason)
 
 
+def get_asset(session: requests.Session, cfg: Config, symbol: str) -> Dict[str, Any]:
+    asset = http_get(session, f"{cfg.trading_base_url}/v2/assets/{symbol}", cfg)
+    return asset if isinstance(asset, dict) else {}
+
+
+def asset_name(asset: Dict[str, Any]) -> str:
+    return str(asset.get("name") or "").strip()
+
+
+def product_name_block_reason(name: str, cfg: Config) -> Optional[str]:
+    """Return a reason when the asset name looks like a leveraged/inverse trading product."""
+    pattern = cfg.blocked_product_name_pattern
+    if not pattern or not name:
+        return None
+
+    try:
+        match = re.search(pattern, name, flags=re.IGNORECASE)
+    except re.error as exc:
+        raise RuntimeError(f"BLOCK_PRODUCT_NAME_PATTERN is not valid regex: {pattern!r}") from exc
+
+    if not match:
+        return None
+
+    return f"product name matched blocked pattern {pattern!r}: {name!r}"
+
+
 def get_snapshot(session: requests.Session, cfg: Config, symbol: str) -> Dict[str, Any]:
     params = {"feed": cfg.alpaca_data_feed} if cfg.alpaca_data_feed else None
     return http_get(session, f"{cfg.data_base_url}/v2/stocks/{symbol}/snapshot", cfg, params=params)
@@ -725,6 +760,8 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, cfg: Config)
     skipped_existing = 0
     skipped_notional = 0
     skipped_recent_failures = 0
+    skipped_product_name_block = 0
+    skipped_asset_lookup = 0
     order_submit_failures = 0
 
     for symbol in candidates:
@@ -744,6 +781,28 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, cfg: Config)
         if symbol in open_buy_orders:
             log.info("Skipping %s: open buy order already exists", symbol)
             skipped_existing += 1
+            continue
+
+        try:
+            asset = get_asset(session, cfg, symbol)
+            name = asset_name(asset)
+        except Exception as exc:
+            if cfg.skip_when_asset_name_unavailable:
+                log.warning("Skipping %s: could not verify asset/product name err=%s", symbol, exc)
+                skipped_asset_lookup += 1
+                continue
+            log.warning("Could not verify asset/product name for %s; allowing buy because SKIP_WHEN_ASSET_NAME_UNAVAILABLE=false err=%s", symbol, exc)
+            name = ""
+
+        if not name and cfg.skip_when_asset_name_unavailable:
+            log.warning("Skipping %s: Alpaca asset lookup returned no product name", symbol)
+            skipped_asset_lookup += 1
+            continue
+
+        block_reason = product_name_block_reason(name, cfg)
+        if block_reason:
+            log.info("Skipping %s: %s", symbol, block_reason)
+            skipped_product_name_block += 1
             continue
 
         account = get_account(session, cfg)
@@ -834,16 +893,20 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, cfg: Config)
         last_skipped_existing=skipped_existing,
         last_skipped_notional=skipped_notional,
         last_skipped_recent_failures=skipped_recent_failures,
+        last_skipped_product_name_block=skipped_product_name_block,
+        last_skipped_asset_lookup=skipped_asset_lookup,
         last_order_submit_failures=order_submit_failures,
     )
     log.info(
-        "Cycle complete candidates=%d orders_submitted=%d filled_or_partial=%d skipped_existing=%d skipped_notional=%d skipped_recent_failures=%d order_submit_failures=%d",
+        "Cycle complete candidates=%d orders_submitted=%d filled_or_partial=%d skipped_existing=%d skipped_notional=%d skipped_recent_failures=%d skipped_product_name_block=%d skipped_asset_lookup=%d order_submit_failures=%d",
         len(candidates),
         orders_submitted,
         filled_or_partial,
         skipped_existing,
         skipped_notional,
         skipped_recent_failures,
+        skipped_product_name_block,
+        skipped_asset_lookup,
         order_submit_failures,
     )
 
@@ -852,7 +915,7 @@ def buyer_loop() -> None:
     cfg = load_config()
     set_state(started_at=now_iso())
     log.info(
-        "Buyer service started sheet_id=%s worksheet=%s range=%s buy_score=%s order_fraction=%.4f paper=%s primary_buying_power_field=buying_power regt_fallback_fraction=%.2f steps=%s cycle_sleep=%.1f extended_hours=%s order_failure_cooldown=%.0f",
+        "Buyer service started sheet_id=%s worksheet=%s range=%s buy_score=%s order_fraction=%.4f paper=%s primary_buying_power_field=buying_power regt_fallback_fraction=%.2f steps=%s cycle_sleep=%.1f extended_hours=%s order_failure_cooldown=%.0f blocked_product_name_pattern=%r skip_when_asset_name_unavailable=%s",
         cfg.google_sheet_id,
         cfg.google_worksheet_name,
         cfg.screener_range,
@@ -864,6 +927,8 @@ def buyer_loop() -> None:
         cfg.cycle_sleep_seconds,
         cfg.extended_hours,
         cfg.order_failure_cooldown_seconds,
+        cfg.blocked_product_name_pattern,
+        cfg.skip_when_asset_name_unavailable,
     )
 
     gc: Optional[gspread.Client] = None
