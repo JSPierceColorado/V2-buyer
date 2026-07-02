@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import gspread
+from gspread.exceptions import WorksheetNotFound
 import requests
 from fastapi import FastAPI
 from google.oauth2.service_account import Credentials
@@ -68,7 +69,13 @@ class Config:
     screener_range: str
     symbol_col_index: int
     score_col_index: int
+    close_col_index: int
+    sma_200_col_index: int
+    sma_50_col_index: int
+    pos_52w_col_index: int
+    dollar_vol_m_col_index: int
     start_row: int
+    entry_log_worksheet_name: str
 
     # Alpaca
     alpaca_api_key: str
@@ -88,6 +95,10 @@ class Config:
     extended_hours: bool
     blocked_product_name_pattern: str
     skip_when_asset_name_unavailable: bool
+    sma200_sizing_enabled: bool
+    sma200_sizing_full_size_distance: float
+    sma200_sizing_max_reduction_distance: float
+    sma200_sizing_min_multiplier: float
 
     # Chasing behavior
     bid_to_market_steps: Tuple[float, ...]
@@ -113,6 +124,18 @@ class OrderAttemptResult:
     submitted: bool
     failure_status: Optional[int] = None
     failure_message: str = ""
+
+
+@dataclass(frozen=True)
+class BuyCandidate:
+    row_num: int
+    symbol: str
+    close: float
+    sma_200: float
+    sma_50: float
+    pos_52w: float
+    dollar_vol_m: float
+    score: float
 
 
 class HttpStatusError(RuntimeError):
@@ -172,7 +195,13 @@ def load_config() -> Config:
         screener_range=os.getenv("SCREENER_RANGE", "A:G").strip(),
         symbol_col_index=getenv_int("SYMBOL_COL_INDEX", 1),
         score_col_index=getenv_int("SCORE_COL_INDEX", 7),
+        close_col_index=getenv_int("CLOSE_COL_INDEX", 2),
+        sma_200_col_index=getenv_int("SMA_200_COL_INDEX", 3),
+        sma_50_col_index=getenv_int("SMA_50_COL_INDEX", 4),
+        pos_52w_col_index=getenv_int("POS_52W_COL_INDEX", 5),
+        dollar_vol_m_col_index=getenv_int("DOLLAR_VOL_M_COL_INDEX", 6),
         start_row=getenv_int("START_ROW", 2),
+        entry_log_worksheet_name=os.getenv("ENTRY_LOG_WORKSHEET_NAME", "Buyer Entry Log").strip(),
         alpaca_api_key=alpaca_api_key,
         alpaca_secret_key=alpaca_secret_key,
         alpaca_paper=alpaca_paper,
@@ -191,6 +220,10 @@ def load_config() -> Config:
             r"\b(daily|inverse|2\s*x|3\s*x)\b",
         ).strip(),
         skip_when_asset_name_unavailable=getenv_bool("SKIP_WHEN_ASSET_NAME_UNAVAILABLE", True),
+        sma200_sizing_enabled=getenv_bool("SMA200_SIZING_ENABLED", True),
+        sma200_sizing_full_size_distance=getenv_float("SMA200_SIZING_FULL_SIZE_DISTANCE", 0.0),
+        sma200_sizing_max_reduction_distance=getenv_float("SMA200_SIZING_MAX_REDUCTION_DISTANCE", 0.50),
+        sma200_sizing_min_multiplier=getenv_float("SMA200_SIZING_MIN_MULTIPLIER", 0.25),
         bid_to_market_steps=steps,
         step_timeout_seconds=getenv_float("STEP_TIMEOUT_SECONDS", 5.0),
         total_chase_timeout_seconds=getenv_float("TOTAL_CHASE_TIMEOUT_SECONDS", 30.0),
@@ -227,6 +260,8 @@ _state: Dict[str, Any] = {
     "last_skipped_recent_failures": 0,
     "last_skipped_product_name_block": 0,
     "last_skipped_asset_lookup": 0,
+    "last_skipped_sma200_sized_below_min": 0,
+    "last_entry_log_rows": 0,
     "last_order_submit_failures": 0,
 }
 _order_failure_cooldowns: Dict[str, Tuple[float, str]] = {}
@@ -410,31 +445,146 @@ def score_matches(value: Any, target: float) -> bool:
     return score >= target
 
 
-def read_buy_candidates(ws: gspread.Worksheet, cfg: Config) -> List[str]:
-    """Read screener rows and return ordered unique symbols where score column equals BUY_SCORE."""
+ENTRY_LOG_HEADERS = [
+    "timestamp",
+    "symbol",
+    "asset_name",
+    "score",
+    "close",
+    "sma_200",
+    "sma_50",
+    "pos_52w",
+    "dollar_vol_m",
+    "close_vs_sma200_pct",
+    "close_vs_sma50_pct",
+    "base_notional",
+    "sma200_sizing_multiplier",
+    "final_notional",
+    "buying_power_field",
+    "buying_power",
+    "order_fraction",
+    "submitted",
+    "filled_or_partial",
+    "failure_status",
+    "failure_message",
+    "regt_fallback_used",
+    "regt_buying_power",
+    "alpaca_paper",
+]
+
+
+def open_or_create_worksheet(gc: gspread.Client, cfg: Config, title: str, headers: Sequence[str]) -> gspread.Worksheet:
+    sheet = gc.open_by_key(cfg.google_sheet_id)
+    try:
+        ws = sheet.worksheet(title)
+    except WorksheetNotFound:
+        ws = sheet.add_worksheet(title=title, rows=1000, cols=max(1, len(headers)))
+        log.info("Created worksheet %r for entry logging", title)
+
+    try:
+        existing = ws.row_values(1)
+        if existing[: len(headers)] != list(headers):
+            ws.update("A1", [list(headers)])
+            log.info("Initialized headers on worksheet %r", title)
+    except Exception as exc:
+        log.warning("Could not initialize headers on worksheet %r: %s", title, exc)
+
+    return ws
+
+
+def read_buy_candidates(ws: gspread.Worksheet, cfg: Config) -> List[BuyCandidate]:
+    """Read screener rows and return ordered unique symbols where score column meets BUY_SCORE."""
     values = ws.get(cfg.screener_range) or []
-    candidates: List[str] = []
+    candidates: List[BuyCandidate] = []
     seen: Set[str] = set()
 
     symbol_idx = cfg.symbol_col_index - 1
     score_idx = cfg.score_col_index - 1
+    close_idx = cfg.close_col_index - 1
+    sma_200_idx = cfg.sma_200_col_index - 1
+    sma_50_idx = cfg.sma_50_col_index - 1
+    pos_52w_idx = cfg.pos_52w_col_index - 1
+    dollar_vol_m_idx = cfg.dollar_vol_m_col_index - 1
+    required_idx = max(symbol_idx, score_idx, close_idx, sma_200_idx, sma_50_idx, pos_52w_idx, dollar_vol_m_idx)
 
     for row_num, row in enumerate(values, start=1):
         if row_num < cfg.start_row:
             continue
-        if len(row) <= max(symbol_idx, score_idx):
+        if len(row) <= required_idx:
             continue
         symbol = clean_symbol(row[symbol_idx])
         if not symbol or symbol == "SYMBOL":
             continue
-        if not score_matches(row[score_idx], cfg.buy_score):
+
+        score = to_float(row[score_idx], default=math.nan)
+        if math.isnan(score) or score < cfg.buy_score:
             continue
         if symbol in seen:
             continue
+
         seen.add(symbol)
-        candidates.append(symbol)
+        candidates.append(
+            BuyCandidate(
+                row_num=row_num,
+                symbol=symbol,
+                close=to_float(row[close_idx], default=0.0),
+                sma_200=to_float(row[sma_200_idx], default=0.0),
+                sma_50=to_float(row[sma_50_idx], default=0.0),
+                pos_52w=to_float(row[pos_52w_idx], default=0.0),
+                dollar_vol_m=to_float(row[dollar_vol_m_idx], default=0.0),
+                score=score,
+            )
+        )
 
     return candidates
+
+
+def safe_pct(numerator: float, denominator: float) -> Optional[float]:
+    if denominator <= 0:
+        return None
+    return (numerator / denominator) - 1.0
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def sma200_sizing_multiplier(candidate: BuyCandidate, cfg: Config) -> Tuple[float, Optional[float], str]:
+    """Scale buy size down as price gets farther above SMA 200.
+
+    Defaults:
+    - At 0% above SMA 200: 100% of normal order size.
+    - At 50%+ above SMA 200: 25% of normal order size.
+    - Between those distances: linear scale-down.
+    """
+    distance = safe_pct(candidate.close, candidate.sma_200)
+    if not cfg.sma200_sizing_enabled:
+        return 1.0, distance, "disabled"
+    if distance is None:
+        return 1.0, distance, "missing_or_invalid_sma200"
+
+    full_size_distance = max(0.0, cfg.sma200_sizing_full_size_distance)
+    max_reduction_distance = max(full_size_distance + 0.000001, cfg.sma200_sizing_max_reduction_distance)
+    min_multiplier = clamp(cfg.sma200_sizing_min_multiplier, 0.01, 1.0)
+
+    extension = max(0.0, distance)
+    if extension <= full_size_distance:
+        return 1.0, distance, "full_size"
+
+    progress = clamp((extension - full_size_distance) / (max_reduction_distance - full_size_distance), 0.0, 1.0)
+    multiplier = 1.0 - ((1.0 - min_multiplier) * progress)
+    return clamp(multiplier, min_multiplier, 1.0), distance, "scaled_by_sma200_distance"
+
+
+def append_entry_log_row(entry_log_ws: Optional[gspread.Worksheet], row: Sequence[Any]) -> bool:
+    if entry_log_ws is None:
+        return False
+    try:
+        entry_log_ws.append_row(list(row), value_input_option="USER_ENTERED")
+        return True
+    except Exception as exc:
+        log.warning("Could not append entry log row: %s", exc)
+        return False
 
 
 # -----------------------------
@@ -745,7 +895,7 @@ def place_best_bid_chasing_order(session: requests.Session, cfg: Config, symbol:
 # -----------------------------
 
 
-def process_cycle(session: requests.Session, ws: gspread.Worksheet, cfg: Config) -> None:
+def process_cycle(session: requests.Session, ws: gspread.Worksheet, entry_log_ws: Optional[gspread.Worksheet], cfg: Config) -> None:
     set_state(last_cycle_started_at=now_iso(), last_error=None)
 
     candidates = read_buy_candidates(ws, cfg)
@@ -762,9 +912,12 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, cfg: Config)
     skipped_recent_failures = 0
     skipped_product_name_block = 0
     skipped_asset_lookup = 0
+    skipped_sma200_sized_below_min = 0
+    entry_log_rows = 0
     order_submit_failures = 0
 
-    for symbol in candidates:
+    for candidate in candidates:
+        symbol = candidate.symbol
         if _stop_event.is_set():
             break
 
@@ -811,54 +964,114 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, cfg: Config)
             log.warning("No positive buying_power found; stopping this cycle")
             break
 
-        notional = round(buying_power * cfg.order_fraction, 2)
-        if notional < cfg.min_notional:
+        base_notional = round(buying_power * cfg.order_fraction, 2)
+        if base_notional < cfg.min_notional:
             log.warning(
-                "Skipping %s: computed notional %.2f is below MIN_NOTIONAL %.2f; stopping this cycle",
+                "Skipping %s: computed base_notional %.2f is below MIN_NOTIONAL %.2f; stopping this cycle",
                 symbol,
-                notional,
+                base_notional,
                 cfg.min_notional,
             )
             skipped_notional += 1
             break
 
+        size_multiplier, close_vs_sma200_pct, sizing_reason = sma200_sizing_multiplier(candidate, cfg)
+        notional = round(base_notional * size_multiplier, 2)
+        if notional < cfg.min_notional:
+            log.warning(
+                "Skipping %s: SMA200-adjusted notional %.2f is below MIN_NOTIONAL %.2f base_notional=%.2f multiplier=%.4f close=%.4f sma_200=%.4f",
+                symbol,
+                notional,
+                cfg.min_notional,
+                base_notional,
+                size_multiplier,
+                candidate.close,
+                candidate.sma_200,
+            )
+            skipped_sma200_sized_below_min += 1
+            continue
+
+        close_vs_sma50_pct = safe_pct(candidate.close, candidate.sma_50)
         log.info(
-            "Buying candidate %s: score=%s notional=%.2f fraction=%.2f%% buying_power_field=%s buying_power=%.2f",
+            "Buying candidate %s: score=%.4f base_notional=%.2f adjusted_notional=%.2f sma200_multiplier=%.4f close_vs_sma200=%s sizing_reason=%s fraction=%.2f%% buying_power_field=%s buying_power=%.2f close=%.4f sma_200=%.4f",
             symbol,
-            cfg.buy_score,
+            candidate.score,
+            base_notional,
             notional,
+            size_multiplier,
+            f"{close_vs_sma200_pct:.2%}" if close_vs_sma200_pct is not None else "n/a",
+            sizing_reason,
             cfg.order_fraction * 100,
             bp_field,
             buying_power,
+            candidate.close,
+            candidate.sma_200,
         )
 
         attempt = place_best_bid_chasing_order(session, cfg, symbol, notional)
         if attempt.submitted:
             orders_submitted += 1
 
+        regt_fallback_used = False
+        regt_buying_power = to_float(account.get("regt_buying_power"), default=0.0)
+
         if not attempt.filled_or_partial and should_retry_with_regt(attempt):
             fallback_notional, regt_buying_power = regt_fallback_notional(account, cfg, notional)
             if fallback_notional >= cfg.min_notional and fallback_notional < notional:
+                regt_fallback_used = True
                 log.info(
-                    "Retrying %s with Reg-T fallback notional=%.2f original_notional=%.2f regt_buying_power=%.2f fallback_fraction=%.2f",
+                    "Retrying %s with Reg-T fallback notional=%.2f original_adjusted_notional=%.2f base_notional=%.2f regt_buying_power=%.2f fallback_fraction=%.2f",
                     symbol,
                     fallback_notional,
                     notional,
+                    base_notional,
                     regt_buying_power,
                     cfg.regt_fallback_fraction,
                 )
+                notional = fallback_notional
                 attempt = place_best_bid_chasing_order(session, cfg, symbol, fallback_notional)
                 if attempt.submitted:
                     orders_submitted += 1
             else:
                 log.warning(
-                    "No usable Reg-T fallback for %s fallback_notional=%.2f original_notional=%.2f regt_buying_power=%.2f min_notional=%.2f",
+                    "No usable Reg-T fallback for %s fallback_notional=%.2f original_adjusted_notional=%.2f regt_buying_power=%.2f min_notional=%.2f",
                     symbol,
                     fallback_notional,
                     notional,
                     regt_buying_power,
                     cfg.min_notional,
                 )
+
+        if append_entry_log_row(
+            entry_log_ws,
+            [
+                now_iso(),
+                symbol,
+                name,
+                round(candidate.score, 6),
+                round(candidate.close, 6),
+                round(candidate.sma_200, 6),
+                round(candidate.sma_50, 6),
+                round(candidate.pos_52w, 6),
+                round(candidate.dollar_vol_m, 6),
+                round(close_vs_sma200_pct, 6) if close_vs_sma200_pct is not None else "",
+                round(close_vs_sma50_pct, 6) if close_vs_sma50_pct is not None else "",
+                base_notional,
+                round(size_multiplier, 6),
+                notional,
+                bp_field,
+                buying_power,
+                cfg.order_fraction,
+                attempt.submitted,
+                attempt.filled_or_partial,
+                attempt.failure_status if attempt.failure_status is not None else "",
+                attempt.failure_message[:500] if attempt.failure_message else "",
+                regt_fallback_used,
+                regt_buying_power,
+                cfg.alpaca_paper,
+            ],
+        ):
+            entry_log_rows += 1
 
         if attempt.filled_or_partial:
             filled_or_partial += 1
@@ -895,10 +1108,12 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, cfg: Config)
         last_skipped_recent_failures=skipped_recent_failures,
         last_skipped_product_name_block=skipped_product_name_block,
         last_skipped_asset_lookup=skipped_asset_lookup,
+        last_skipped_sma200_sized_below_min=skipped_sma200_sized_below_min,
+        last_entry_log_rows=entry_log_rows,
         last_order_submit_failures=order_submit_failures,
     )
     log.info(
-        "Cycle complete candidates=%d orders_submitted=%d filled_or_partial=%d skipped_existing=%d skipped_notional=%d skipped_recent_failures=%d skipped_product_name_block=%d skipped_asset_lookup=%d order_submit_failures=%d",
+        "Cycle complete candidates=%d orders_submitted=%d filled_or_partial=%d skipped_existing=%d skipped_notional=%d skipped_recent_failures=%d skipped_product_name_block=%d skipped_asset_lookup=%d skipped_sma200_sized_below_min=%d entry_log_rows=%d order_submit_failures=%d",
         len(candidates),
         orders_submitted,
         filled_or_partial,
@@ -907,6 +1122,8 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, cfg: Config)
         skipped_recent_failures,
         skipped_product_name_block,
         skipped_asset_lookup,
+        skipped_sma200_sized_below_min,
+        entry_log_rows,
         order_submit_failures,
     )
 
@@ -915,7 +1132,7 @@ def buyer_loop() -> None:
     cfg = load_config()
     set_state(started_at=now_iso())
     log.info(
-        "Buyer service started sheet_id=%s worksheet=%s range=%s buy_score=%s order_fraction=%.4f paper=%s primary_buying_power_field=buying_power regt_fallback_fraction=%.2f steps=%s cycle_sleep=%.1f extended_hours=%s order_failure_cooldown=%.0f blocked_product_name_pattern=%r skip_when_asset_name_unavailable=%s",
+        "Buyer service started sheet_id=%s worksheet=%s range=%s buy_score=%s order_fraction=%.4f paper=%s primary_buying_power_field=buying_power regt_fallback_fraction=%.2f steps=%s cycle_sleep=%.1f extended_hours=%s order_failure_cooldown=%.0f blocked_product_name_pattern=%r skip_when_asset_name_unavailable=%s sma200_sizing_enabled=%s sma200_min_multiplier=%.2f sma200_max_reduction_distance=%.2f entry_log_worksheet=%r",
         cfg.google_sheet_id,
         cfg.google_worksheet_name,
         cfg.screener_range,
@@ -929,10 +1146,15 @@ def buyer_loop() -> None:
         cfg.order_failure_cooldown_seconds,
         cfg.blocked_product_name_pattern,
         cfg.skip_when_asset_name_unavailable,
+        cfg.sma200_sizing_enabled,
+        cfg.sma200_sizing_min_multiplier,
+        cfg.sma200_sizing_max_reduction_distance,
+        cfg.entry_log_worksheet_name,
     )
 
     gc: Optional[gspread.Client] = None
     ws: Optional[gspread.Worksheet] = None
+    entry_log_ws: Optional[gspread.Worksheet] = None
     session = requests.Session()
 
     while not _stop_event.is_set():
@@ -941,13 +1163,16 @@ def buyer_loop() -> None:
                 gc = create_gspread_client(cfg)
             if ws is None:
                 ws = open_worksheet(gc, cfg)
-            process_cycle(session, ws, cfg)
+            if entry_log_ws is None:
+                entry_log_ws = open_or_create_worksheet(gc, cfg, cfg.entry_log_worksheet_name, ENTRY_LOG_HEADERS)
+            process_cycle(session, ws, entry_log_ws, cfg)
         except Exception as exc:
             log.exception("Buyer loop error: %s", exc)
             set_state(last_error=str(exc))
             # Force re-open Google resources next time; helps if token/sheet handle gets stale.
             gc = None
             ws = None
+            entry_log_ws = None
             time.sleep(cfg.error_sleep_seconds)
 
         time.sleep(cfg.cycle_sleep_seconds)
