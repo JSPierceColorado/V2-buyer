@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import gspread
@@ -16,7 +16,7 @@ from fastapi import FastAPI
 from google.oauth2.service_account import Credentials
 
 
-APP_VERSION = "1.1.0-sma50-extension-sizing"
+APP_VERSION = "1.2.0-risk-gate-ranked-reentry"
 
 
 # -----------------------------
@@ -107,6 +107,30 @@ class Config:
     sma50_sizing_max_reduction_distance: float
     sma50_sizing_min_multiplier: float
 
+    # Portfolio risk gate / ranking / re-entry behavior
+    risk_gate_enabled: bool
+    max_total_positions: int
+    yellow_exposure_pct: float
+    red_exposure_pct: float
+    yellow_min_cash_pct: float
+    red_min_cash_pct: float
+    yellow_margin_use_pct: float
+    red_margin_use_pct: float
+    yellow_red_position_pct: float
+    red_red_position_pct: float
+    yellow_drawdown_pct: float
+    red_drawdown_pct: float
+    equity_high_watermark: float
+    yellow_max_orders_per_cycle: int
+    yellow_order_fraction_multiplier: float
+    rank_candidates_enabled: bool
+    reentry_guard_enabled: bool
+    reentry_lookback_days: int
+    reentry_min_discount_pct: float
+    reentry_require_above_sma50: bool
+    reentry_allow_in_yellow: bool
+    reentry_allow_without_sell_price: bool
+
     # Chasing behavior
     bid_to_market_steps: Tuple[float, ...]
     step_timeout_seconds: float
@@ -143,6 +167,44 @@ class BuyCandidate:
     pos_52w: float
     dollar_vol_m: float
     score: float
+
+
+@dataclass(frozen=True)
+class PositionSnapshot:
+    symbol: str
+    qty: float
+    market_value: float
+    unrealized_pl: float
+    unrealized_plpc: float
+
+
+@dataclass(frozen=True)
+class RecentSellFill:
+    symbol: str
+    price: float
+    qty: float
+    transaction_time: str
+
+
+@dataclass(frozen=True)
+class RiskSnapshot:
+    mode: str
+    reasons: Tuple[str, ...]
+    equity: float
+    cash: float
+    cash_pct: float
+    exposure_pct: float
+    margin_use_pct: float
+    drawdown_pct: float
+    high_watermark: float
+    position_count: int
+    open_buy_order_count: int
+    red_position_count: int
+    green_position_count: int
+    red_position_pct: float
+    available_position_slots: int
+    max_new_orders_this_cycle: int
+    order_fraction_multiplier: float
 
 
 class HttpStatusError(RuntimeError):
@@ -235,6 +297,28 @@ def load_config() -> Config:
         sma50_sizing_full_size_distance=getenv_float("SMA50_SIZING_FULL_SIZE_DISTANCE", 0.15),
         sma50_sizing_max_reduction_distance=getenv_float("SMA50_SIZING_MAX_REDUCTION_DISTANCE", 0.30),
         sma50_sizing_min_multiplier=getenv_float("SMA50_SIZING_MIN_MULTIPLIER", 0.50),
+        risk_gate_enabled=getenv_bool("RISK_GATE_ENABLED", True),
+        max_total_positions=getenv_int("MAX_TOTAL_POSITIONS", 60),
+        yellow_exposure_pct=getenv_float("YELLOW_EXPOSURE_PCT", 0.75),
+        red_exposure_pct=getenv_float("RED_EXPOSURE_PCT", 0.90),
+        yellow_min_cash_pct=getenv_float("YELLOW_MIN_CASH_PCT", 0.07),
+        red_min_cash_pct=getenv_float("RED_MIN_CASH_PCT", 0.02),
+        yellow_margin_use_pct=getenv_float("YELLOW_MARGIN_USE_PCT", 0.75),
+        red_margin_use_pct=getenv_float("RED_MARGIN_USE_PCT", 0.90),
+        yellow_red_position_pct=getenv_float("YELLOW_RED_POSITION_PCT", 0.55),
+        red_red_position_pct=getenv_float("RED_RED_POSITION_PCT", 0.70),
+        yellow_drawdown_pct=getenv_float("YELLOW_DRAWDOWN_PCT", 0.05),
+        red_drawdown_pct=getenv_float("RED_DRAWDOWN_PCT", 0.10),
+        equity_high_watermark=getenv_float("EQUITY_HIGH_WATERMARK", 0.0),
+        yellow_max_orders_per_cycle=getenv_int("YELLOW_MAX_ORDERS_PER_CYCLE", 2),
+        yellow_order_fraction_multiplier=getenv_float("YELLOW_ORDER_FRACTION_MULTIPLIER", 0.50),
+        rank_candidates_enabled=getenv_bool("RANK_CANDIDATES_ENABLED", True),
+        reentry_guard_enabled=getenv_bool("REENTRY_GUARD_ENABLED", True),
+        reentry_lookback_days=getenv_int("REENTRY_LOOKBACK_DAYS", 10),
+        reentry_min_discount_pct=getenv_float("REENTRY_MIN_DISCOUNT_PCT", 0.02),
+        reentry_require_above_sma50=getenv_bool("REENTRY_REQUIRE_ABOVE_SMA50", True),
+        reentry_allow_in_yellow=getenv_bool("REENTRY_ALLOW_IN_YELLOW", False),
+        reentry_allow_without_sell_price=getenv_bool("REENTRY_ALLOW_WITHOUT_SELL_PRICE", False),
         bid_to_market_steps=steps,
         step_timeout_seconds=getenv_float("STEP_TIMEOUT_SECONDS", 5.0),
         total_chase_timeout_seconds=getenv_float("TOTAL_CHASE_TIMEOUT_SECONDS", 30.0),
@@ -273,10 +357,24 @@ _state: Dict[str, Any] = {
     "last_skipped_asset_lookup": 0,
     "last_skipped_sma200_sized_below_min": 0,
     "last_skipped_entry_sized_below_min": 0,
+    "last_skipped_reentry_guard": 0,
+    "last_risk_mode": None,
+    "last_risk_reasons": [],
+    "last_position_count": 0,
+    "last_open_buy_order_count": 0,
+    "last_available_position_slots": 0,
+    "last_max_new_orders_this_cycle": 0,
+    "last_equity": 0.0,
+    "last_cash_pct": 0.0,
+    "last_exposure_pct": 0.0,
+    "last_margin_use_pct": 0.0,
+    "last_drawdown_pct": 0.0,
+    "last_red_position_pct": 0.0,
     "last_entry_log_rows": 0,
     "last_order_submit_failures": 0,
 }
 _order_failure_cooldowns: Dict[str, Tuple[float, str]] = {}
+_equity_high_watermark: float = 0.0
 
 
 # -----------------------------
@@ -486,6 +584,13 @@ ENTRY_LOG_HEADERS = [
     "entry_sizing_multiplier",
     "sma50_sizing_reason",
     "entry_sizing_reason",
+    "rank_score",
+    "rank_reason",
+    "risk_mode",
+    "risk_reasons",
+    "position_count",
+    "available_position_slots",
+    "reentry_decision",
     "app_version",
 ]
 
@@ -673,16 +778,40 @@ def should_retry_with_regt(attempt: OrderAttemptResult) -> bool:
     )
 
 
-def list_position_symbols(session: requests.Session, cfg: Config) -> Set[str]:
+def list_positions(session: requests.Session, cfg: Config) -> List[PositionSnapshot]:
     try:
         positions = http_get(session, f"{cfg.trading_base_url}/v2/positions", cfg)
-    except requests.HTTPError as exc:
+    except Exception as exc:
         # Alpaca returns an empty list when no positions in normal operation; this is just defensive.
         log.warning("Could not list positions: %s", exc)
-        return set()
+        return []
     if not isinstance(positions, list):
+        return []
+
+    result: List[PositionSnapshot] = []
+    for p in positions:
+        if not isinstance(p, dict):
+            continue
+        symbol = clean_symbol(p.get("symbol"))
+        if not symbol:
+            continue
+        result.append(
+            PositionSnapshot(
+                symbol=symbol,
+                qty=to_float(p.get("qty"), default=0.0),
+                market_value=to_float(p.get("market_value"), default=0.0),
+                unrealized_pl=to_float(p.get("unrealized_pl"), default=0.0),
+                unrealized_plpc=to_float(p.get("unrealized_plpc"), default=0.0),
+            )
+        )
+    return result
+
+
+def list_position_symbols(session: requests.Session, cfg: Config) -> Set[str]:
+    positions = list_positions(session, cfg)
+    if not positions:
         return set()
-    return {clean_symbol(p.get("symbol")) for p in positions if clean_symbol(p.get("symbol"))}
+    return {p.symbol for p in positions}
 
 
 def list_open_buy_order_symbols(session: requests.Session, cfg: Config) -> Set[str]:
@@ -697,6 +826,280 @@ def list_open_buy_order_symbols(session: requests.Session, cfg: Config) -> Set[s
             if sym:
                 result.add(sym)
     return result
+
+
+def positive_ratio(numerator: float, denominator: float) -> float:
+    if denominator <= 0:
+        return 0.0
+    return numerator / denominator
+
+
+def candidate_quality_score(candidate: BuyCandidate) -> Tuple[float, str]:
+    """Secondary ranking for candidates that already passed BUY_SCORE.
+
+    The Sheet score remains the primary ranking input. This tie-breaker favors:
+    - stronger 52-week position,
+    - better liquidity,
+    - price above major trend lines,
+    - less over-extension above SMA50/SMA200.
+    """
+    pos_score = clamp(candidate.pos_52w, 0.0, 1.0) * 100.0
+    liquidity_score = min(25.0, math.log10(max(candidate.dollar_vol_m, 0.0) + 1.0) * 8.0)
+
+    close_vs_sma50 = safe_pct(candidate.close, candidate.sma_50)
+    close_vs_sma200 = safe_pct(candidate.close, candidate.sma_200)
+
+    trend_bonus = 0.0
+    if close_vs_sma50 is not None and close_vs_sma50 >= 0:
+        trend_bonus += 10.0
+    if close_vs_sma200 is not None and close_vs_sma200 >= 0:
+        trend_bonus += 5.0
+
+    extension_penalty = 0.0
+    if close_vs_sma50 is not None:
+        extension_penalty += max(0.0, close_vs_sma50 - 0.15) * 120.0
+    if close_vs_sma200 is not None:
+        extension_penalty += max(0.0, close_vs_sma200 - 0.50) * 60.0
+
+    quality = pos_score + liquidity_score + trend_bonus - extension_penalty
+    sma50_text = f"{close_vs_sma50:.4f}" if close_vs_sma50 is not None else "n/a"
+    sma200_text = f"{close_vs_sma200:.4f}" if close_vs_sma200 is not None else "n/a"
+    reason = (
+        f"pos52w={candidate.pos_52w:.4f}|dollar_vol_m={candidate.dollar_vol_m:.2f}|"
+        f"close_vs_sma50={sma50_text}|close_vs_sma200={sma200_text}"
+    )
+    return quality, reason
+
+
+def ranked_buy_candidates(candidates: Sequence[BuyCandidate], cfg: Config) -> List[BuyCandidate]:
+    if not cfg.rank_candidates_enabled:
+        return list(candidates)
+
+    return sorted(
+        candidates,
+        key=lambda c: (
+            c.score,
+            candidate_quality_score(c)[0],
+            -c.row_num,
+        ),
+        reverse=True,
+    )
+
+
+def update_equity_high_watermark(equity: float, cfg: Config) -> float:
+    global _equity_high_watermark
+    configured = max(0.0, cfg.equity_high_watermark)
+    if _equity_high_watermark <= 0:
+        _equity_high_watermark = max(configured, equity)
+    else:
+        _equity_high_watermark = max(_equity_high_watermark, configured, equity)
+    return _equity_high_watermark
+
+
+def build_risk_snapshot(
+    account: Dict[str, Any],
+    positions: Sequence[PositionSnapshot],
+    open_buy_orders: Set[str],
+    cfg: Config,
+) -> RiskSnapshot:
+    equity = to_float(account.get("equity"), default=0.0)
+    cash = to_float(account.get("cash"), default=0.0)
+    long_market_value = to_float(account.get("long_market_value"), default=0.0)
+    if long_market_value <= 0 and positions:
+        long_market_value = sum(max(0.0, p.market_value) for p in positions)
+
+    initial_margin = to_float(account.get("initial_margin"), default=0.0)
+    high_watermark = update_equity_high_watermark(equity, cfg)
+
+    cash_pct = positive_ratio(cash, equity)
+    exposure_pct = positive_ratio(long_market_value, equity)
+    margin_use_pct = positive_ratio(initial_margin, equity)
+    if margin_use_pct <= 0 and cash < 0:
+        margin_use_pct = exposure_pct
+    drawdown_pct = positive_ratio(equity, high_watermark) - 1.0 if high_watermark > 0 else 0.0
+
+    position_count = len(positions)
+    open_buy_order_count = len(open_buy_orders)
+    red_position_count = sum(1 for p in positions if p.unrealized_plpc < 0 or p.unrealized_pl < 0)
+    green_position_count = sum(1 for p in positions if p.unrealized_plpc > 0 or p.unrealized_pl > 0)
+    red_position_pct = positive_ratio(red_position_count, position_count)
+
+    if cfg.max_total_positions > 0:
+        available_position_slots = max(0, cfg.max_total_positions - position_count - open_buy_order_count)
+    else:
+        available_position_slots = 1_000_000
+
+    red_reasons: List[str] = []
+    yellow_reasons: List[str] = []
+
+    if not cfg.risk_gate_enabled:
+        mode = "GREEN"
+        reasons: Tuple[str, ...] = ("risk_gate_disabled",)
+    else:
+        if equity <= 0:
+            red_reasons.append("equity<=0")
+        if to_float(account.get("buying_power"), default=0.0) <= 0:
+            red_reasons.append("buying_power<=0")
+        if cfg.max_total_positions > 0 and available_position_slots <= 0:
+            red_reasons.append(f"position_cap_reached:{position_count}+{open_buy_order_count}>={cfg.max_total_positions}")
+        if exposure_pct >= cfg.red_exposure_pct:
+            red_reasons.append(f"exposure_pct={exposure_pct:.2%}>={cfg.red_exposure_pct:.2%}")
+        elif exposure_pct >= cfg.yellow_exposure_pct:
+            yellow_reasons.append(f"exposure_pct={exposure_pct:.2%}>={cfg.yellow_exposure_pct:.2%}")
+        if cash_pct <= cfg.red_min_cash_pct:
+            red_reasons.append(f"cash_pct={cash_pct:.2%}<={cfg.red_min_cash_pct:.2%}")
+        elif cash_pct <= cfg.yellow_min_cash_pct:
+            yellow_reasons.append(f"cash_pct={cash_pct:.2%}<={cfg.yellow_min_cash_pct:.2%}")
+        if margin_use_pct >= cfg.red_margin_use_pct:
+            red_reasons.append(f"margin_use_pct={margin_use_pct:.2%}>={cfg.red_margin_use_pct:.2%}")
+        elif margin_use_pct >= cfg.yellow_margin_use_pct:
+            yellow_reasons.append(f"margin_use_pct={margin_use_pct:.2%}>={cfg.yellow_margin_use_pct:.2%}")
+        if position_count > 0:
+            if red_position_pct >= cfg.red_red_position_pct:
+                red_reasons.append(f"red_position_pct={red_position_pct:.2%}>={cfg.red_red_position_pct:.2%}")
+            elif red_position_pct >= cfg.yellow_red_position_pct:
+                yellow_reasons.append(f"red_position_pct={red_position_pct:.2%}>={cfg.yellow_red_position_pct:.2%}")
+        if drawdown_pct <= -abs(cfg.red_drawdown_pct):
+            red_reasons.append(f"drawdown_pct={drawdown_pct:.2%}<=-{abs(cfg.red_drawdown_pct):.2%}")
+        elif drawdown_pct <= -abs(cfg.yellow_drawdown_pct):
+            yellow_reasons.append(f"drawdown_pct={drawdown_pct:.2%}<=-{abs(cfg.yellow_drawdown_pct):.2%}")
+
+        if red_reasons:
+            mode = "RED"
+            reasons = tuple(red_reasons)
+        elif yellow_reasons:
+            mode = "YELLOW"
+            reasons = tuple(yellow_reasons)
+        else:
+            mode = "GREEN"
+            reasons = ("risk_ok",)
+
+    if mode == "RED":
+        max_new_orders_this_cycle = 0
+        order_fraction_multiplier = 0.0
+    elif mode == "YELLOW":
+        max_new_orders_this_cycle = cfg.yellow_max_orders_per_cycle if cfg.yellow_max_orders_per_cycle > 0 else available_position_slots
+        max_new_orders_this_cycle = min(max_new_orders_this_cycle, available_position_slots)
+        order_fraction_multiplier = clamp(cfg.yellow_order_fraction_multiplier, 0.01, 1.0)
+    else:
+        max_new_orders_this_cycle = available_position_slots
+        order_fraction_multiplier = 1.0
+
+    if cfg.max_orders_per_cycle > 0:
+        max_new_orders_this_cycle = min(max_new_orders_this_cycle, cfg.max_orders_per_cycle)
+
+    return RiskSnapshot(
+        mode=mode,
+        reasons=reasons,
+        equity=equity,
+        cash=cash,
+        cash_pct=cash_pct,
+        exposure_pct=exposure_pct,
+        margin_use_pct=margin_use_pct,
+        drawdown_pct=drawdown_pct,
+        high_watermark=high_watermark,
+        position_count=position_count,
+        open_buy_order_count=open_buy_order_count,
+        red_position_count=red_position_count,
+        green_position_count=green_position_count,
+        red_position_pct=red_position_pct,
+        available_position_slots=available_position_slots,
+        max_new_orders_this_cycle=max_new_orders_this_cycle,
+        order_fraction_multiplier=order_fraction_multiplier,
+    )
+
+
+def set_risk_state(risk: RiskSnapshot) -> None:
+    set_state(
+        last_risk_mode=risk.mode,
+        last_risk_reasons=list(risk.reasons),
+        last_position_count=risk.position_count,
+        last_open_buy_order_count=risk.open_buy_order_count,
+        last_available_position_slots=risk.available_position_slots,
+        last_max_new_orders_this_cycle=risk.max_new_orders_this_cycle,
+        last_equity=round(risk.equity, 4),
+        last_cash_pct=round(risk.cash_pct, 6),
+        last_exposure_pct=round(risk.exposure_pct, 6),
+        last_margin_use_pct=round(risk.margin_use_pct, 6),
+        last_drawdown_pct=round(risk.drawdown_pct, 6),
+        last_red_position_pct=round(risk.red_position_pct, 6),
+    )
+
+
+def list_recent_sell_fills(session: requests.Session, cfg: Config) -> Dict[str, RecentSellFill]:
+    if not cfg.reentry_guard_enabled or cfg.reentry_lookback_days <= 0:
+        return {}
+
+    after_dt = datetime.now(timezone.utc) - timedelta(days=cfg.reentry_lookback_days)
+    params = {
+        "after": after_dt.isoformat(),
+        "direction": "desc",
+        "page_size": 100,
+    }
+    try:
+        activities = http_get(session, f"{cfg.trading_base_url}/v2/account/activities/FILL", cfg, params=params)
+    except Exception as exc:
+        log.warning("Could not list recent sell fills for re-entry guard; allowing normal candidate flow err=%s", exc)
+        return {}
+
+    result: Dict[str, RecentSellFill] = {}
+    if not isinstance(activities, list):
+        return result
+
+    for activity in activities:
+        if not isinstance(activity, dict):
+            continue
+        side = str(activity.get("side") or "").strip().lower()
+        if side != "sell":
+            continue
+        symbol = clean_symbol(activity.get("symbol"))
+        if not symbol or symbol in result:
+            continue
+        price = to_float(activity.get("price") or activity.get("filled_avg_price"), default=0.0)
+        qty = to_float(activity.get("qty") or activity.get("quantity"), default=0.0)
+        tx_time = str(activity.get("transaction_time") or activity.get("date") or "")
+        result[symbol] = RecentSellFill(symbol=symbol, price=price, qty=qty, transaction_time=tx_time)
+    return result
+
+
+def reentry_guard_decision(
+    candidate: BuyCandidate,
+    recent_sell_fills: Dict[str, RecentSellFill],
+    risk: RiskSnapshot,
+    cfg: Config,
+) -> Tuple[bool, str]:
+    if not cfg.reentry_guard_enabled:
+        return True, "reentry_guard_disabled"
+    fill = recent_sell_fills.get(candidate.symbol)
+    if not fill:
+        return True, "no_recent_sell"
+
+    if risk.mode == "YELLOW" and not cfg.reentry_allow_in_yellow:
+        return False, f"recent_sell_{cfg.reentry_lookback_days}d_blocked_in_yellow"
+    if risk.mode == "RED":
+        return False, f"recent_sell_{cfg.reentry_lookback_days}d_blocked_in_red"
+
+    if fill.price <= 0 or candidate.close <= 0:
+        if cfg.reentry_allow_without_sell_price:
+            return True, f"recent_sell_no_price_allowed tx={fill.transaction_time}"
+        return False, f"recent_sell_no_usable_price tx={fill.transaction_time}"
+
+    discount = (fill.price - candidate.close) / fill.price
+    discount_ok = discount >= cfg.reentry_min_discount_pct
+    trend_ok = True
+    if cfg.reentry_require_above_sma50 and candidate.sma_50 > 0:
+        trend_ok = candidate.close >= candidate.sma_50
+
+    if discount_ok and trend_ok:
+        return True, (
+            f"recent_sell_reentry_allowed discount={discount:.2%} sell_price={fill.price:.4f} "
+            f"close={candidate.close:.4f} trend_ok={trend_ok}"
+        )
+
+    return False, (
+        f"recent_sell_reentry_blocked discount={discount:.2%} min_discount={cfg.reentry_min_discount_pct:.2%} "
+        f"sell_price={fill.price:.4f} close={candidate.close:.4f} trend_ok={trend_ok} tx={fill.transaction_time}"
+    )
 
 
 def cooldown_reason(symbol: str) -> Optional[str]:
@@ -957,11 +1360,38 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, entry_log_ws
     set_state(last_cycle_started_at=now_iso(), last_error=None)
 
     candidates = read_buy_candidates(ws, cfg)
-    log.info("Found %d unique buy candidates with score=%s", len(candidates), cfg.buy_score)
+    candidates = ranked_buy_candidates(candidates, cfg)
+    log.info(
+        "Found %d unique buy candidates with score>=%s rank_candidates_enabled=%s",
+        len(candidates),
+        cfg.buy_score,
+        cfg.rank_candidates_enabled,
+    )
 
-    positions = list_position_symbols(session, cfg)
+    account = get_account(session, cfg)
+    position_snapshots = list_positions(session, cfg)
+    positions = {p.symbol for p in position_snapshots}
     open_buy_orders = list_open_buy_order_symbols(session, cfg)
-    log.info("Existing positions=%d open_buy_orders=%d", len(positions), len(open_buy_orders))
+    risk = build_risk_snapshot(account, position_snapshots, open_buy_orders, cfg)
+    set_risk_state(risk)
+
+    log.info(
+        "Risk gate mode=%s reasons=%s equity=%.2f cash_pct=%.2f%% exposure_pct=%.2f%% margin_use_pct=%.2f%% drawdown_pct=%.2f%% positions=%d open_buy_orders=%d red/green=%d/%d available_slots=%d max_new_orders_this_cycle=%d order_fraction_multiplier=%.2f",
+        risk.mode,
+        ";".join(risk.reasons),
+        risk.equity,
+        risk.cash_pct * 100,
+        risk.exposure_pct * 100,
+        risk.margin_use_pct * 100,
+        risk.drawdown_pct * 100,
+        risk.position_count,
+        risk.open_buy_order_count,
+        risk.red_position_count,
+        risk.green_position_count,
+        risk.available_position_slots,
+        risk.max_new_orders_this_cycle,
+        risk.order_fraction_multiplier,
+    )
 
     orders_submitted = 0
     filled_or_partial = 0
@@ -971,13 +1401,49 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, entry_log_ws
     skipped_product_name_block = 0
     skipped_asset_lookup = 0
     skipped_entry_sized_below_min = 0
+    skipped_reentry_guard = 0
     entry_log_rows = 0
     order_submit_failures = 0
+
+    if risk.max_new_orders_this_cycle <= 0:
+        log.warning("Risk gate blocks new buys this cycle mode=%s reasons=%s", risk.mode, ";".join(risk.reasons))
+        set_state(
+            last_cycle_finished_at=now_iso(),
+            last_candidates=len(candidates),
+            last_orders_submitted=0,
+            last_orders_filled_or_partial=0,
+            last_skipped_existing=0,
+            last_skipped_notional=0,
+            last_skipped_recent_failures=0,
+            last_skipped_product_name_block=0,
+            last_skipped_asset_lookup=0,
+            last_skipped_sma200_sized_below_min=0,
+            last_skipped_entry_sized_below_min=0,
+            last_skipped_reentry_guard=0,
+            last_entry_log_rows=0,
+            last_order_submit_failures=0,
+        )
+        return
+
+    recent_sell_fills = list_recent_sell_fills(session, cfg)
+    if recent_sell_fills:
+        log.info("Loaded %d recent sell fills for re-entry guard lookback_days=%d", len(recent_sell_fills), cfg.reentry_lookback_days)
 
     for candidate in candidates:
         symbol = candidate.symbol
         if _stop_event.is_set():
             break
+
+        if orders_submitted >= risk.max_new_orders_this_cycle:
+            log.info(
+                "Risk-adjusted max new orders reached orders_submitted=%d limit=%d mode=%s; ending cycle",
+                orders_submitted,
+                risk.max_new_orders_this_cycle,
+                risk.mode,
+            )
+            break
+
+        rank_score, rank_reason = candidate_quality_score(candidate)
 
         recent_failure = cooldown_reason(symbol)
         if recent_failure:
@@ -992,6 +1458,12 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, entry_log_ws
         if symbol in open_buy_orders:
             log.info("Skipping %s: open buy order already exists", symbol)
             skipped_existing += 1
+            continue
+
+        reentry_allowed, reentry_decision = reentry_guard_decision(candidate, recent_sell_fills, risk, cfg)
+        if not reentry_allowed:
+            log.info("Skipping %s: re-entry guard %s", symbol, reentry_decision)
+            skipped_reentry_guard += 1
             continue
 
         try:
@@ -1022,7 +1494,8 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, entry_log_ws
             log.warning("No positive buying_power found; stopping this cycle")
             break
 
-        base_notional = round(buying_power * cfg.order_fraction, 2)
+        effective_order_fraction = cfg.order_fraction * risk.order_fraction_multiplier
+        base_notional = round(buying_power * effective_order_fraction, 2)
         if base_notional < cfg.min_notional:
             log.warning(
                 "Skipping %s: computed base_notional %.2f is below MIN_NOTIONAL %.2f; stopping this cycle",
@@ -1057,9 +1530,11 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, entry_log_ws
             continue
 
         log.info(
-            "Buying candidate %s: score=%.4f base_notional=%.2f adjusted_notional=%.2f entry_multiplier=%.4f sma200_multiplier=%.4f sma50_multiplier=%.4f close_vs_sma200=%s close_vs_sma50=%s sizing_reason=%s fraction=%.2f%% buying_power_field=%s buying_power=%.2f close=%.4f sma_200=%.4f sma_50=%.4f",
+            "Buying candidate %s: score=%.4f rank_score=%.4f risk_mode=%s base_notional=%.2f adjusted_notional=%.2f entry_multiplier=%.4f sma200_multiplier=%.4f sma50_multiplier=%.4f close_vs_sma200=%s close_vs_sma50=%s sizing_reason=%s effective_fraction=%.2f%% buying_power_field=%s buying_power=%.2f close=%.4f sma_200=%.4f sma_50=%.4f reentry=%s",
             symbol,
             candidate.score,
+            rank_score,
+            risk.mode,
             base_notional,
             notional,
             entry_sizing_multiplier,
@@ -1068,12 +1543,13 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, entry_log_ws
             f"{close_vs_sma200_pct:.2%}" if close_vs_sma200_pct is not None else "n/a",
             f"{close_vs_sma50_pct:.2%}" if close_vs_sma50_pct is not None else "n/a",
             entry_sizing_reason,
-            cfg.order_fraction * 100,
+            effective_order_fraction * 100,
             bp_field,
             buying_power,
             candidate.close,
             candidate.sma_200,
             candidate.sma_50,
+            reentry_decision,
         )
 
         attempt = place_best_bid_chasing_order(session, cfg, symbol, notional)
@@ -1129,7 +1605,7 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, entry_log_ws
                 notional,
                 bp_field,
                 buying_power,
-                cfg.order_fraction,
+                effective_order_fraction,
                 attempt.submitted,
                 attempt.filled_or_partial,
                 attempt.failure_status if attempt.failure_status is not None else "",
@@ -1141,6 +1617,13 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, entry_log_ws
                 round(entry_sizing_multiplier, 6),
                 sma50_sizing_reason,
                 entry_sizing_reason,
+                round(rank_score, 6),
+                rank_reason,
+                risk.mode,
+                ";".join(risk.reasons),
+                risk.position_count,
+                risk.available_position_slots,
+                reentry_decision,
                 APP_VERSION,
             ],
         ):
@@ -1167,10 +1650,6 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, entry_log_ws
             except Exception as exc:
                 log.warning("Could not refresh open buy orders after failed attempt for %s: %s", symbol, exc)
 
-        if cfg.max_orders_per_cycle > 0 and orders_submitted >= cfg.max_orders_per_cycle:
-            log.info("MAX_ORDERS_PER_CYCLE=%d reached; ending cycle", cfg.max_orders_per_cycle)
-            break
-
     set_state(
         last_cycle_finished_at=now_iso(),
         last_candidates=len(candidates),
@@ -1183,17 +1662,20 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, entry_log_ws
         last_skipped_asset_lookup=skipped_asset_lookup,
         last_skipped_sma200_sized_below_min=skipped_entry_sized_below_min,
         last_skipped_entry_sized_below_min=skipped_entry_sized_below_min,
+        last_skipped_reentry_guard=skipped_reentry_guard,
         last_entry_log_rows=entry_log_rows,
         last_order_submit_failures=order_submit_failures,
     )
     log.info(
-        "Cycle complete candidates=%d orders_submitted=%d filled_or_partial=%d skipped_existing=%d skipped_notional=%d skipped_recent_failures=%d skipped_product_name_block=%d skipped_asset_lookup=%d skipped_entry_sized_below_min=%d entry_log_rows=%d order_submit_failures=%d",
+        "Cycle complete risk_mode=%s candidates=%d orders_submitted=%d filled_or_partial=%d skipped_existing=%d skipped_notional=%d skipped_recent_failures=%d skipped_reentry_guard=%d skipped_product_name_block=%d skipped_asset_lookup=%d skipped_entry_sized_below_min=%d entry_log_rows=%d order_submit_failures=%d",
+        risk.mode,
         len(candidates),
         orders_submitted,
         filled_or_partial,
         skipped_existing,
         skipped_notional,
         skipped_recent_failures,
+        skipped_reentry_guard,
         skipped_product_name_block,
         skipped_asset_lookup,
         skipped_entry_sized_below_min,
@@ -1206,7 +1688,7 @@ def buyer_loop() -> None:
     cfg = load_config()
     set_state(started_at=now_iso())
     log.info(
-        "Buyer service started version=%s sheet_id=%s worksheet=%s range=%s buy_score=%s order_fraction=%.4f paper=%s primary_buying_power_field=buying_power regt_fallback_fraction=%.2f steps=%s cycle_sleep=%.1f extended_hours=%s order_failure_cooldown=%.0f blocked_product_name_pattern=%r skip_when_asset_name_unavailable=%s sma200_sizing_enabled=%s sma200_min_multiplier=%.2f sma200_max_reduction_distance=%.2f sma50_sizing_enabled=%s sma50_full_size_distance=%.2f sma50_max_reduction_distance=%.2f sma50_min_multiplier=%.2f entry_log_worksheet=%r",
+        "Buyer service started version=%s sheet_id=%s worksheet=%s range=%s buy_score=%s order_fraction=%.4f paper=%s primary_buying_power_field=buying_power regt_fallback_fraction=%.2f steps=%s cycle_sleep=%.1f extended_hours=%s order_failure_cooldown=%.0f blocked_product_name_pattern=%r skip_when_asset_name_unavailable=%s sma200_sizing_enabled=%s sma200_min_multiplier=%.2f sma200_max_reduction_distance=%.2f sma50_sizing_enabled=%s sma50_full_size_distance=%.2f sma50_max_reduction_distance=%.2f sma50_min_multiplier=%.2f risk_gate_enabled=%s max_total_positions=%d red_exposure_pct=%.2f red_min_cash_pct=%.2f red_margin_use_pct=%.2f yellow_max_orders_per_cycle=%d yellow_order_fraction_multiplier=%.2f rank_candidates_enabled=%s reentry_guard_enabled=%s reentry_lookback_days=%d reentry_min_discount_pct=%.2f entry_log_worksheet=%r",
         APP_VERSION,
         cfg.google_sheet_id,
         cfg.google_worksheet_name,
@@ -1228,6 +1710,17 @@ def buyer_loop() -> None:
         cfg.sma50_sizing_full_size_distance,
         cfg.sma50_sizing_max_reduction_distance,
         cfg.sma50_sizing_min_multiplier,
+        cfg.risk_gate_enabled,
+        cfg.max_total_positions,
+        cfg.red_exposure_pct,
+        cfg.red_min_cash_pct,
+        cfg.red_margin_use_pct,
+        cfg.yellow_max_orders_per_cycle,
+        cfg.yellow_order_fraction_multiplier,
+        cfg.rank_candidates_enabled,
+        cfg.reentry_guard_enabled,
+        cfg.reentry_lookback_days,
+        cfg.reentry_min_discount_pct,
         cfg.entry_log_worksheet_name,
     )
 
