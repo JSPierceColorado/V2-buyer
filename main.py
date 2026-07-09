@@ -16,6 +16,9 @@ from fastapi import FastAPI
 from google.oauth2.service_account import Credentials
 
 
+APP_VERSION = "1.1.0-sma50-extension-sizing"
+
+
 # -----------------------------
 # Logging
 # -----------------------------
@@ -99,6 +102,10 @@ class Config:
     sma200_sizing_full_size_distance: float
     sma200_sizing_max_reduction_distance: float
     sma200_sizing_min_multiplier: float
+    sma50_sizing_enabled: bool
+    sma50_sizing_full_size_distance: float
+    sma50_sizing_max_reduction_distance: float
+    sma50_sizing_min_multiplier: float
 
     # Chasing behavior
     bid_to_market_steps: Tuple[float, ...]
@@ -224,6 +231,10 @@ def load_config() -> Config:
         sma200_sizing_full_size_distance=getenv_float("SMA200_SIZING_FULL_SIZE_DISTANCE", 0.0),
         sma200_sizing_max_reduction_distance=getenv_float("SMA200_SIZING_MAX_REDUCTION_DISTANCE", 0.50),
         sma200_sizing_min_multiplier=getenv_float("SMA200_SIZING_MIN_MULTIPLIER", 0.25),
+        sma50_sizing_enabled=getenv_bool("SMA50_SIZING_ENABLED", True),
+        sma50_sizing_full_size_distance=getenv_float("SMA50_SIZING_FULL_SIZE_DISTANCE", 0.15),
+        sma50_sizing_max_reduction_distance=getenv_float("SMA50_SIZING_MAX_REDUCTION_DISTANCE", 0.30),
+        sma50_sizing_min_multiplier=getenv_float("SMA50_SIZING_MIN_MULTIPLIER", 0.50),
         bid_to_market_steps=steps,
         step_timeout_seconds=getenv_float("STEP_TIMEOUT_SECONDS", 5.0),
         total_chase_timeout_seconds=getenv_float("TOTAL_CHASE_TIMEOUT_SECONDS", 30.0),
@@ -261,6 +272,7 @@ _state: Dict[str, Any] = {
     "last_skipped_product_name_block": 0,
     "last_skipped_asset_lookup": 0,
     "last_skipped_sma200_sized_below_min": 0,
+    "last_skipped_entry_sized_below_min": 0,
     "last_entry_log_rows": 0,
     "last_order_submit_failures": 0,
 }
@@ -470,6 +482,11 @@ ENTRY_LOG_HEADERS = [
     "regt_fallback_used",
     "regt_buying_power",
     "alpaca_paper",
+    "sma50_sizing_multiplier",
+    "entry_sizing_multiplier",
+    "sma50_sizing_reason",
+    "entry_sizing_reason",
+    "app_version",
 ]
 
 
@@ -549,6 +566,38 @@ def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def extension_sizing_multiplier(
+    *,
+    distance: Optional[float],
+    enabled: bool,
+    full_size_distance: float,
+    max_reduction_distance: float,
+    min_multiplier: float,
+    label: str,
+) -> Tuple[float, Optional[float], str]:
+    """Scale buy size down as price gets farther above a moving average.
+
+    This intentionally never returns zero. The Buyer still avoids hard skips for
+    over-extension; it only reduces notional size.
+    """
+    if not enabled:
+        return 1.0, distance, f"{label}_disabled"
+    if distance is None:
+        return 1.0, distance, f"missing_or_invalid_{label}"
+
+    full_size_distance = max(0.0, full_size_distance)
+    max_reduction_distance = max(full_size_distance + 0.000001, max_reduction_distance)
+    min_multiplier = clamp(min_multiplier, 0.01, 1.0)
+
+    extension = max(0.0, distance)
+    if extension <= full_size_distance:
+        return 1.0, distance, f"{label}_full_size"
+
+    progress = clamp((extension - full_size_distance) / (max_reduction_distance - full_size_distance), 0.0, 1.0)
+    multiplier = 1.0 - ((1.0 - min_multiplier) * progress)
+    return clamp(multiplier, min_multiplier, 1.0), distance, f"scaled_by_{label}_distance"
+
+
 def sma200_sizing_multiplier(candidate: BuyCandidate, cfg: Config) -> Tuple[float, Optional[float], str]:
     """Scale buy size down as price gets farther above SMA 200.
 
@@ -557,23 +606,32 @@ def sma200_sizing_multiplier(candidate: BuyCandidate, cfg: Config) -> Tuple[floa
     - At 50%+ above SMA 200: 25% of normal order size.
     - Between those distances: linear scale-down.
     """
-    distance = safe_pct(candidate.close, candidate.sma_200)
-    if not cfg.sma200_sizing_enabled:
-        return 1.0, distance, "disabled"
-    if distance is None:
-        return 1.0, distance, "missing_or_invalid_sma200"
+    return extension_sizing_multiplier(
+        distance=safe_pct(candidate.close, candidate.sma_200),
+        enabled=cfg.sma200_sizing_enabled,
+        full_size_distance=cfg.sma200_sizing_full_size_distance,
+        max_reduction_distance=cfg.sma200_sizing_max_reduction_distance,
+        min_multiplier=cfg.sma200_sizing_min_multiplier,
+        label="sma200",
+    )
 
-    full_size_distance = max(0.0, cfg.sma200_sizing_full_size_distance)
-    max_reduction_distance = max(full_size_distance + 0.000001, cfg.sma200_sizing_max_reduction_distance)
-    min_multiplier = clamp(cfg.sma200_sizing_min_multiplier, 0.01, 1.0)
 
-    extension = max(0.0, distance)
-    if extension <= full_size_distance:
-        return 1.0, distance, "full_size"
+def sma50_sizing_multiplier(candidate: BuyCandidate, cfg: Config) -> Tuple[float, Optional[float], str]:
+    """Scale buy size down as price gets farther above SMA 50.
 
-    progress = clamp((extension - full_size_distance) / (max_reduction_distance - full_size_distance), 0.0, 1.0)
-    multiplier = 1.0 - ((1.0 - min_multiplier) * progress)
-    return clamp(multiplier, min_multiplier, 1.0), distance, "scaled_by_sma200_distance"
+    Defaults:
+    - At <= 15% above SMA 50: 100% of SMA200-adjusted order size.
+    - At 30%+ above SMA 50: 50% of SMA200-adjusted order size.
+    - Between those distances: linear scale-down.
+    """
+    return extension_sizing_multiplier(
+        distance=safe_pct(candidate.close, candidate.sma_50),
+        enabled=cfg.sma50_sizing_enabled,
+        full_size_distance=cfg.sma50_sizing_full_size_distance,
+        max_reduction_distance=cfg.sma50_sizing_max_reduction_distance,
+        min_multiplier=cfg.sma50_sizing_min_multiplier,
+        label="sma50",
+    )
 
 
 def append_entry_log_row(entry_log_ws: Optional[gspread.Worksheet], row: Sequence[Any]) -> bool:
@@ -912,7 +970,7 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, entry_log_ws
     skipped_recent_failures = 0
     skipped_product_name_block = 0
     skipped_asset_lookup = 0
-    skipped_sma200_sized_below_min = 0
+    skipped_entry_sized_below_min = 0
     entry_log_rows = 0
     order_submit_failures = 0
 
@@ -975,37 +1033,47 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, entry_log_ws
             skipped_notional += 1
             break
 
-        size_multiplier, close_vs_sma200_pct, sizing_reason = sma200_sizing_multiplier(candidate, cfg)
-        notional = round(base_notional * size_multiplier, 2)
+        sma200_multiplier, close_vs_sma200_pct, sma200_sizing_reason = sma200_sizing_multiplier(candidate, cfg)
+        sma50_multiplier, close_vs_sma50_pct, sma50_sizing_reason = sma50_sizing_multiplier(candidate, cfg)
+        entry_sizing_multiplier = clamp(sma200_multiplier * sma50_multiplier, 0.01, 1.0)
+        entry_sizing_reason = f"{sma200_sizing_reason}|{sma50_sizing_reason}"
+        notional = round(base_notional * entry_sizing_multiplier, 2)
+
         if notional < cfg.min_notional:
             log.warning(
-                "Skipping %s: SMA200-adjusted notional %.2f is below MIN_NOTIONAL %.2f base_notional=%.2f multiplier=%.4f close=%.4f sma_200=%.4f",
+                "Skipping %s: entry-adjusted notional %.2f is below MIN_NOTIONAL %.2f base_notional=%.2f entry_multiplier=%.4f sma200_multiplier=%.4f sma50_multiplier=%.4f close=%.4f sma_200=%.4f sma_50=%.4f",
                 symbol,
                 notional,
                 cfg.min_notional,
                 base_notional,
-                size_multiplier,
+                entry_sizing_multiplier,
+                sma200_multiplier,
+                sma50_multiplier,
                 candidate.close,
                 candidate.sma_200,
+                candidate.sma_50,
             )
-            skipped_sma200_sized_below_min += 1
+            skipped_entry_sized_below_min += 1
             continue
 
-        close_vs_sma50_pct = safe_pct(candidate.close, candidate.sma_50)
         log.info(
-            "Buying candidate %s: score=%.4f base_notional=%.2f adjusted_notional=%.2f sma200_multiplier=%.4f close_vs_sma200=%s sizing_reason=%s fraction=%.2f%% buying_power_field=%s buying_power=%.2f close=%.4f sma_200=%.4f",
+            "Buying candidate %s: score=%.4f base_notional=%.2f adjusted_notional=%.2f entry_multiplier=%.4f sma200_multiplier=%.4f sma50_multiplier=%.4f close_vs_sma200=%s close_vs_sma50=%s sizing_reason=%s fraction=%.2f%% buying_power_field=%s buying_power=%.2f close=%.4f sma_200=%.4f sma_50=%.4f",
             symbol,
             candidate.score,
             base_notional,
             notional,
-            size_multiplier,
+            entry_sizing_multiplier,
+            sma200_multiplier,
+            sma50_multiplier,
             f"{close_vs_sma200_pct:.2%}" if close_vs_sma200_pct is not None else "n/a",
-            sizing_reason,
+            f"{close_vs_sma50_pct:.2%}" if close_vs_sma50_pct is not None else "n/a",
+            entry_sizing_reason,
             cfg.order_fraction * 100,
             bp_field,
             buying_power,
             candidate.close,
             candidate.sma_200,
+            candidate.sma_50,
         )
 
         attempt = place_best_bid_chasing_order(session, cfg, symbol, notional)
@@ -1057,7 +1125,7 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, entry_log_ws
                 round(close_vs_sma200_pct, 6) if close_vs_sma200_pct is not None else "",
                 round(close_vs_sma50_pct, 6) if close_vs_sma50_pct is not None else "",
                 base_notional,
-                round(size_multiplier, 6),
+                round(sma200_multiplier, 6),
                 notional,
                 bp_field,
                 buying_power,
@@ -1069,6 +1137,11 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, entry_log_ws
                 regt_fallback_used,
                 regt_buying_power,
                 cfg.alpaca_paper,
+                round(sma50_multiplier, 6),
+                round(entry_sizing_multiplier, 6),
+                sma50_sizing_reason,
+                entry_sizing_reason,
+                APP_VERSION,
             ],
         ):
             entry_log_rows += 1
@@ -1108,12 +1181,13 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, entry_log_ws
         last_skipped_recent_failures=skipped_recent_failures,
         last_skipped_product_name_block=skipped_product_name_block,
         last_skipped_asset_lookup=skipped_asset_lookup,
-        last_skipped_sma200_sized_below_min=skipped_sma200_sized_below_min,
+        last_skipped_sma200_sized_below_min=skipped_entry_sized_below_min,
+        last_skipped_entry_sized_below_min=skipped_entry_sized_below_min,
         last_entry_log_rows=entry_log_rows,
         last_order_submit_failures=order_submit_failures,
     )
     log.info(
-        "Cycle complete candidates=%d orders_submitted=%d filled_or_partial=%d skipped_existing=%d skipped_notional=%d skipped_recent_failures=%d skipped_product_name_block=%d skipped_asset_lookup=%d skipped_sma200_sized_below_min=%d entry_log_rows=%d order_submit_failures=%d",
+        "Cycle complete candidates=%d orders_submitted=%d filled_or_partial=%d skipped_existing=%d skipped_notional=%d skipped_recent_failures=%d skipped_product_name_block=%d skipped_asset_lookup=%d skipped_entry_sized_below_min=%d entry_log_rows=%d order_submit_failures=%d",
         len(candidates),
         orders_submitted,
         filled_or_partial,
@@ -1122,7 +1196,7 @@ def process_cycle(session: requests.Session, ws: gspread.Worksheet, entry_log_ws
         skipped_recent_failures,
         skipped_product_name_block,
         skipped_asset_lookup,
-        skipped_sma200_sized_below_min,
+        skipped_entry_sized_below_min,
         entry_log_rows,
         order_submit_failures,
     )
@@ -1132,7 +1206,8 @@ def buyer_loop() -> None:
     cfg = load_config()
     set_state(started_at=now_iso())
     log.info(
-        "Buyer service started sheet_id=%s worksheet=%s range=%s buy_score=%s order_fraction=%.4f paper=%s primary_buying_power_field=buying_power regt_fallback_fraction=%.2f steps=%s cycle_sleep=%.1f extended_hours=%s order_failure_cooldown=%.0f blocked_product_name_pattern=%r skip_when_asset_name_unavailable=%s sma200_sizing_enabled=%s sma200_min_multiplier=%.2f sma200_max_reduction_distance=%.2f entry_log_worksheet=%r",
+        "Buyer service started version=%s sheet_id=%s worksheet=%s range=%s buy_score=%s order_fraction=%.4f paper=%s primary_buying_power_field=buying_power regt_fallback_fraction=%.2f steps=%s cycle_sleep=%.1f extended_hours=%s order_failure_cooldown=%.0f blocked_product_name_pattern=%r skip_when_asset_name_unavailable=%s sma200_sizing_enabled=%s sma200_min_multiplier=%.2f sma200_max_reduction_distance=%.2f sma50_sizing_enabled=%s sma50_full_size_distance=%.2f sma50_max_reduction_distance=%.2f sma50_min_multiplier=%.2f entry_log_worksheet=%r",
+        APP_VERSION,
         cfg.google_sheet_id,
         cfg.google_worksheet_name,
         cfg.screener_range,
@@ -1149,6 +1224,10 @@ def buyer_loop() -> None:
         cfg.sma200_sizing_enabled,
         cfg.sma200_sizing_min_multiplier,
         cfg.sma200_sizing_max_reduction_distance,
+        cfg.sma50_sizing_enabled,
+        cfg.sma50_sizing_full_size_distance,
+        cfg.sma50_sizing_max_reduction_distance,
+        cfg.sma50_sizing_min_multiplier,
         cfg.entry_log_worksheet_name,
     )
 
@@ -1194,10 +1273,12 @@ def on_shutdown() -> None:
 
 @app.get("/")
 def root() -> Dict[str, str]:
-    return {"status": "ok", "service": "alpaca-score-buyer"}
+    return {"status": "ok", "service": "alpaca-score-buyer", "app_version": APP_VERSION}
 
 
 @app.get("/healthz")
 def healthz() -> Dict[str, Any]:
     with _state_lock:
-        return dict(_state)
+        result = dict(_state)
+    result["app_version"] = APP_VERSION
+    return result
