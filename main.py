@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from google.oauth2.service_account import Credentials
 
 
-APP_VERSION = "1.3.0-concentration-gate"
+APP_VERSION = "1.4.0-recovery-mode"
 
 
 # -----------------------------
@@ -125,6 +125,16 @@ class Config:
     equity_high_watermark: float
     yellow_max_orders_per_cycle: int
     yellow_order_fraction_multiplier: float
+
+    # Controlled recovery mode: permits limited buying only when the account is
+    # deeply drawn down / broadly red but already de-risked with ample cash.
+    recovery_mode_enabled: bool
+    recovery_max_exposure_pct: float
+    recovery_min_cash_pct: float
+    recovery_max_margin_use_pct: float
+    recovery_max_new_entries_per_day: int
+    recovery_order_fraction_multiplier: float
+
     rank_candidates_enabled: bool
     reentry_guard_enabled: bool
     reentry_lookback_days: int
@@ -225,6 +235,8 @@ class RiskSnapshot:
     available_position_slots: int
     max_new_orders_this_cycle: int
     order_fraction_multiplier: float
+    recovery_entries_today: int
+    recovery_entries_remaining: int
 
 
 @dataclass(frozen=True)
@@ -390,6 +402,14 @@ def load_config() -> Config:
         equity_high_watermark=getenv_float("EQUITY_HIGH_WATERMARK", 0.0),
         yellow_max_orders_per_cycle=getenv_int("YELLOW_MAX_ORDERS_PER_CYCLE", 2),
         yellow_order_fraction_multiplier=getenv_float("YELLOW_ORDER_FRACTION_MULTIPLIER", 0.50),
+        recovery_mode_enabled=getenv_bool("RECOVERY_MODE_ENABLED", True),
+        recovery_max_exposure_pct=max(0.0, getenv_float("RECOVERY_MAX_EXPOSURE_PCT", 0.50)),
+        recovery_min_cash_pct=max(0.0, getenv_float("RECOVERY_MIN_CASH_PCT", 0.30)),
+        recovery_max_margin_use_pct=max(0.0, getenv_float("RECOVERY_MAX_MARGIN_USE_PCT", 0.50)),
+        recovery_max_new_entries_per_day=max(0, getenv_int("RECOVERY_MAX_NEW_ENTRIES_PER_DAY", 1)),
+        recovery_order_fraction_multiplier=clamp(
+            getenv_float("RECOVERY_ORDER_FRACTION_MULTIPLIER", 0.25), 0.01, 1.0
+        ),
         rank_candidates_enabled=getenv_bool("RANK_CANDIDATES_ENABLED", True),
         reentry_guard_enabled=getenv_bool("REENTRY_GUARD_ENABLED", True),
         reentry_lookback_days=getenv_int("REENTRY_LOOKBACK_DAYS", 10),
@@ -475,6 +495,8 @@ _state: Dict[str, Any] = {
     "last_margin_use_pct": 0.0,
     "last_drawdown_pct": 0.0,
     "last_red_position_pct": 0.0,
+    "last_recovery_entries_today": 0,
+    "last_recovery_entries_remaining": 0,
     "last_risk_map_symbols": 0,
     "last_unknown_position_symbols": [],
     "last_concentration_gate_block_reason": None,
@@ -717,6 +739,8 @@ ENTRY_LOG_HEADERS = [
     "sector_stressed",
     "group_stressed",
     "concentration_decision",
+    "recovery_entries_today",
+    "recovery_entries_remaining",
 ]
 
 RISK_MAP_HEADERS = ["symbol", "sector", "risk_group"]
@@ -913,6 +937,72 @@ def market_timezone(cfg: Config) -> ZoneInfo:
     except Exception as exc:
         log.warning("Invalid MARKET_TIMEZONE=%r; using America/New_York err=%s", cfg.market_timezone, exc)
         return ZoneInfo("America/New_York")
+
+
+def count_today_successful_entries(
+    entry_log_ws: Optional[gspread.Worksheet],
+    cfg: Config,
+) -> int:
+    """Count successful Buyer entries for the current New York trading date.
+
+    The count is reconstructed from Buyer Entry Log on every cycle so Railway
+    restarts do not reset the Recovery Mode daily limit. Failed submissions do
+    not count. When the alpaca_paper column is present, rows from the other
+    account mode are ignored.
+    """
+    if entry_log_ws is None:
+        return 0
+
+    try:
+        values = entry_log_ws.get_all_values()
+    except Exception as exc:
+        # Fail closed for Recovery Mode. An unreadable log must not silently
+        # reset the daily allowance and permit repeated entries after restarts.
+        log.warning(
+            "Could not read Buyer Entry Log for Recovery Mode daily counter; "
+            "treating daily allowance as exhausted err=%s",
+            exc,
+        )
+        return max(0, cfg.recovery_max_new_entries_per_day)
+
+    if len(values) < 2:
+        return 0
+
+    headers = [str(value).strip().lower() for value in values[0]]
+    header_idx = {name: idx for idx, name in enumerate(headers)}
+    if "timestamp" not in header_idx or "filled_or_partial" not in header_idx:
+        log.warning(
+            "Buyer Entry Log is missing timestamp/filled_or_partial fields; "
+            "treating Recovery Mode daily allowance as exhausted"
+        )
+        return max(0, cfg.recovery_max_new_entries_per_day)
+
+    tz = market_timezone(cfg)
+    today = datetime.now(tz).date()
+    successful_entries = 0
+
+    for row in values[1:]:
+        def cell(name: str) -> str:
+            idx = header_idx.get(name)
+            return row[idx] if idx is not None and idx < len(row) else ""
+
+        timestamp = parse_iso_datetime(cell("timestamp"))
+        if timestamp is None:
+            continue
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        if timestamp.astimezone(tz).date() != today:
+            continue
+        if not cell_is_true(cell("filled_or_partial")):
+            continue
+
+        paper_value = cell("alpaca_paper").strip()
+        if paper_value and cell_is_true(paper_value) != cfg.alpaca_paper:
+            continue
+
+        successful_entries += 1
+
+    return successful_entries
 
 
 def read_symbol_risk_map(
@@ -1413,9 +1503,11 @@ def build_risk_snapshot(
     positions: Sequence[PositionSnapshot],
     open_buy_orders: Set[str],
     cfg: Config,
+    successful_entries_today: int = 0,
 ) -> RiskSnapshot:
     equity = to_float(account.get("equity"), default=0.0)
     cash = to_float(account.get("cash"), default=0.0)
+    buying_power = to_float(account.get("buying_power"), default=0.0)
     long_market_value = to_float(account.get("long_market_value"), default=0.0)
     if long_market_value <= 0 and positions:
         long_market_value = sum(max(0.0, p.market_value) for p in positions)
@@ -1441,7 +1533,17 @@ def build_risk_snapshot(
     else:
         available_position_slots = 1_000_000
 
-    red_reasons: List[str] = []
+    successful_entries_today = max(0, int(successful_entries_today))
+    recovery_entries_remaining = max(
+        0, cfg.recovery_max_new_entries_per_day - successful_entries_today
+    )
+
+    # Hard RED conditions mean the portfolio is actively unsafe and may never
+    # be overridden by Recovery Mode. Drawdown and red-position breadth are
+    # recoverable RED conditions: they may permit a small entry only after the
+    # account has already de-risked to the configured cash/exposure limits.
+    hard_red_reasons: List[str] = []
+    recoverable_red_reasons: List[str] = []
     yellow_reasons: List[str] = []
 
     if not cfg.risk_gate_enabled:
@@ -1449,36 +1551,92 @@ def build_risk_snapshot(
         reasons: Tuple[str, ...] = ("risk_gate_disabled",)
     else:
         if equity <= 0:
-            red_reasons.append("equity<=0")
-        if to_float(account.get("buying_power"), default=0.0) <= 0:
-            red_reasons.append("buying_power<=0")
+            hard_red_reasons.append("equity<=0")
+        if buying_power <= 0:
+            hard_red_reasons.append("buying_power<=0")
         if cfg.max_total_positions > 0 and available_position_slots <= 0:
-            red_reasons.append(f"position_cap_reached:{position_count}+{open_buy_order_count}>={cfg.max_total_positions}")
+            hard_red_reasons.append(
+                f"position_cap_reached:{position_count}+{open_buy_order_count}>={cfg.max_total_positions}"
+            )
+
         if exposure_pct >= cfg.red_exposure_pct:
-            red_reasons.append(f"exposure_pct={exposure_pct:.2%}>={cfg.red_exposure_pct:.2%}")
+            hard_red_reasons.append(
+                f"exposure_pct={exposure_pct:.2%}>={cfg.red_exposure_pct:.2%}"
+            )
         elif exposure_pct >= cfg.yellow_exposure_pct:
-            yellow_reasons.append(f"exposure_pct={exposure_pct:.2%}>={cfg.yellow_exposure_pct:.2%}")
+            yellow_reasons.append(
+                f"exposure_pct={exposure_pct:.2%}>={cfg.yellow_exposure_pct:.2%}"
+            )
+
         if cash_pct <= cfg.red_min_cash_pct:
-            red_reasons.append(f"cash_pct={cash_pct:.2%}<={cfg.red_min_cash_pct:.2%}")
+            hard_red_reasons.append(
+                f"cash_pct={cash_pct:.2%}<={cfg.red_min_cash_pct:.2%}"
+            )
         elif cash_pct <= cfg.yellow_min_cash_pct:
-            yellow_reasons.append(f"cash_pct={cash_pct:.2%}<={cfg.yellow_min_cash_pct:.2%}")
+            yellow_reasons.append(
+                f"cash_pct={cash_pct:.2%}<={cfg.yellow_min_cash_pct:.2%}"
+            )
+
         if margin_use_pct >= cfg.red_margin_use_pct:
-            red_reasons.append(f"margin_use_pct={margin_use_pct:.2%}>={cfg.red_margin_use_pct:.2%}")
+            hard_red_reasons.append(
+                f"margin_use_pct={margin_use_pct:.2%}>={cfg.red_margin_use_pct:.2%}"
+            )
         elif margin_use_pct >= cfg.yellow_margin_use_pct:
-            yellow_reasons.append(f"margin_use_pct={margin_use_pct:.2%}>={cfg.yellow_margin_use_pct:.2%}")
+            yellow_reasons.append(
+                f"margin_use_pct={margin_use_pct:.2%}>={cfg.yellow_margin_use_pct:.2%}"
+            )
+
         if position_count > 0:
             if red_position_pct >= cfg.red_red_position_pct:
-                red_reasons.append(f"red_position_pct={red_position_pct:.2%}>={cfg.red_red_position_pct:.2%}")
+                recoverable_red_reasons.append(
+                    f"red_position_pct={red_position_pct:.2%}>={cfg.red_red_position_pct:.2%}"
+                )
             elif red_position_pct >= cfg.yellow_red_position_pct:
-                yellow_reasons.append(f"red_position_pct={red_position_pct:.2%}>={cfg.yellow_red_position_pct:.2%}")
-        if drawdown_pct <= -abs(cfg.red_drawdown_pct):
-            red_reasons.append(f"drawdown_pct={drawdown_pct:.2%}<=-{abs(cfg.red_drawdown_pct):.2%}")
-        elif drawdown_pct <= -abs(cfg.yellow_drawdown_pct):
-            yellow_reasons.append(f"drawdown_pct={drawdown_pct:.2%}<=-{abs(cfg.yellow_drawdown_pct):.2%}")
+                yellow_reasons.append(
+                    f"red_position_pct={red_position_pct:.2%}>={cfg.yellow_red_position_pct:.2%}"
+                )
 
-        if red_reasons:
+        if drawdown_pct <= -abs(cfg.red_drawdown_pct):
+            recoverable_red_reasons.append(
+                f"drawdown_pct={drawdown_pct:.2%}<=-{abs(cfg.red_drawdown_pct):.2%}"
+            )
+        elif drawdown_pct <= -abs(cfg.yellow_drawdown_pct):
+            yellow_reasons.append(
+                f"drawdown_pct={drawdown_pct:.2%}<=-{abs(cfg.yellow_drawdown_pct):.2%}"
+            )
+
+        if hard_red_reasons:
             mode = "RED"
-            reasons = tuple(red_reasons)
+            reasons = tuple(hard_red_reasons + recoverable_red_reasons)
+        elif recoverable_red_reasons:
+            recovery_block_reasons: List[str] = []
+            if not cfg.recovery_mode_enabled:
+                recovery_block_reasons.append("recovery_mode_disabled")
+            if exposure_pct > cfg.recovery_max_exposure_pct:
+                recovery_block_reasons.append(
+                    f"recovery_exposure_pct={exposure_pct:.2%}>{cfg.recovery_max_exposure_pct:.2%}"
+                )
+            if cash_pct < cfg.recovery_min_cash_pct:
+                recovery_block_reasons.append(
+                    f"recovery_cash_pct={cash_pct:.2%}<{cfg.recovery_min_cash_pct:.2%}"
+                )
+            if margin_use_pct > cfg.recovery_max_margin_use_pct:
+                recovery_block_reasons.append(
+                    f"recovery_margin_use_pct={margin_use_pct:.2%}>{cfg.recovery_max_margin_use_pct:.2%}"
+                )
+
+            if recovery_block_reasons:
+                mode = "RED"
+                reasons = tuple(recoverable_red_reasons + recovery_block_reasons)
+            else:
+                mode = "RECOVERY"
+                recovery_reasons = ["controlled_recovery"] + recoverable_red_reasons
+                if recovery_entries_remaining <= 0:
+                    recovery_reasons.append(
+                        "recovery_daily_entry_limit_reached:"
+                        f"{successful_entries_today}>={cfg.recovery_max_new_entries_per_day}"
+                    )
+                reasons = tuple(recovery_reasons)
         elif yellow_reasons:
             mode = "YELLOW"
             reasons = tuple(yellow_reasons)
@@ -1489,16 +1647,33 @@ def build_risk_snapshot(
     if mode == "RED":
         max_new_orders_this_cycle = 0
         order_fraction_multiplier = 0.0
+    elif mode == "RECOVERY":
+        max_new_orders_this_cycle = min(
+            available_position_slots, recovery_entries_remaining
+        )
+        order_fraction_multiplier = clamp(
+            cfg.recovery_order_fraction_multiplier, 0.01, 1.0
+        )
     elif mode == "YELLOW":
-        max_new_orders_this_cycle = cfg.yellow_max_orders_per_cycle if cfg.yellow_max_orders_per_cycle > 0 else available_position_slots
-        max_new_orders_this_cycle = min(max_new_orders_this_cycle, available_position_slots)
-        order_fraction_multiplier = clamp(cfg.yellow_order_fraction_multiplier, 0.01, 1.0)
+        max_new_orders_this_cycle = (
+            cfg.yellow_max_orders_per_cycle
+            if cfg.yellow_max_orders_per_cycle > 0
+            else available_position_slots
+        )
+        max_new_orders_this_cycle = min(
+            max_new_orders_this_cycle, available_position_slots
+        )
+        order_fraction_multiplier = clamp(
+            cfg.yellow_order_fraction_multiplier, 0.01, 1.0
+        )
     else:
         max_new_orders_this_cycle = available_position_slots
         order_fraction_multiplier = 1.0
 
     if cfg.max_orders_per_cycle > 0:
-        max_new_orders_this_cycle = min(max_new_orders_this_cycle, cfg.max_orders_per_cycle)
+        max_new_orders_this_cycle = min(
+            max_new_orders_this_cycle, cfg.max_orders_per_cycle
+        )
 
     return RiskSnapshot(
         mode=mode,
@@ -1518,6 +1693,8 @@ def build_risk_snapshot(
         available_position_slots=available_position_slots,
         max_new_orders_this_cycle=max_new_orders_this_cycle,
         order_fraction_multiplier=order_fraction_multiplier,
+        recovery_entries_today=successful_entries_today,
+        recovery_entries_remaining=recovery_entries_remaining,
     )
 
 
@@ -1535,6 +1712,8 @@ def set_risk_state(risk: RiskSnapshot) -> None:
         last_margin_use_pct=round(risk.margin_use_pct, 6),
         last_drawdown_pct=round(risk.drawdown_pct, 6),
         last_red_position_pct=round(risk.red_position_pct, 6),
+        last_recovery_entries_today=risk.recovery_entries_today,
+        last_recovery_entries_remaining=risk.recovery_entries_remaining,
     )
 
 
@@ -1586,8 +1765,10 @@ def reentry_guard_decision(
     if not fill:
         return True, "no_recent_sell"
 
-    if risk.mode == "YELLOW" and not cfg.reentry_allow_in_yellow:
-        return False, f"recent_sell_{cfg.reentry_lookback_days}d_blocked_in_yellow"
+    if risk.mode in {"YELLOW", "RECOVERY"} and not cfg.reentry_allow_in_yellow:
+        return False, (
+            f"recent_sell_{cfg.reentry_lookback_days}d_blocked_in_{risk.mode.lower()}"
+        )
     if risk.mode == "RED":
         return False, f"recent_sell_{cfg.reentry_lookback_days}d_blocked_in_red"
 
@@ -1890,7 +2071,14 @@ def process_cycle(
     position_snapshots = list_positions(session, cfg)
     positions = {p.symbol for p in position_snapshots}
     open_buy_orders = list_open_buy_order_symbols(session, cfg)
-    risk = build_risk_snapshot(account, position_snapshots, open_buy_orders, cfg)
+    successful_entries_today = count_today_successful_entries(entry_log_ws, cfg)
+    risk = build_risk_snapshot(
+        account,
+        position_snapshots,
+        open_buy_orders,
+        cfg,
+        successful_entries_today=successful_entries_today,
+    )
     set_risk_state(risk)
 
     risk_map = read_symbol_risk_map(risk_map_ws)
@@ -1899,7 +2087,7 @@ def process_cycle(
     set_state(last_concentration_gate_block_reason=None)
 
     log.info(
-        "Risk gate mode=%s reasons=%s equity=%.2f cash_pct=%.2f%% exposure_pct=%.2f%% margin_use_pct=%.2f%% drawdown_pct=%.2f%% positions=%d open_buy_orders=%d red/green=%d/%d available_slots=%d max_new_orders_this_cycle=%d order_fraction_multiplier=%.2f",
+        "Risk gate mode=%s reasons=%s equity=%.2f cash_pct=%.2f%% exposure_pct=%.2f%% margin_use_pct=%.2f%% drawdown_pct=%.2f%% positions=%d open_buy_orders=%d red/green=%d/%d available_slots=%d max_new_orders_this_cycle=%d order_fraction_multiplier=%.2f recovery_entries_today=%d recovery_entries_remaining=%d",
         risk.mode,
         ";".join(risk.reasons),
         risk.equity,
@@ -1914,6 +2102,8 @@ def process_cycle(
         risk.available_position_slots,
         risk.max_new_orders_this_cycle,
         risk.order_fraction_multiplier,
+        risk.recovery_entries_today,
+        risk.recovery_entries_remaining,
     )
     log.info(
         "Concentration gate enabled=%s risk_map_symbols=%d unknown_policy=%s unknown_positions=%s",
@@ -2288,6 +2478,8 @@ def process_cycle(
                 final_concentration_check.sector_stressed,
                 final_concentration_check.group_stressed,
                 final_concentration_check.reason,
+                risk.recovery_entries_today,
+                risk.recovery_entries_remaining,
             ],
         ):
             entry_log_rows += 1
@@ -2343,7 +2535,7 @@ def buyer_loop() -> None:
     cfg = load_config()
     set_state(started_at=now_iso())
     log.info(
-        "Buyer service started version=%s sheet_id=%s worksheet=%s range=%s buy_score=%s order_fraction=%.4f paper=%s primary_buying_power_field=buying_power regt_fallback_fraction=%.2f steps=%s cycle_sleep=%.1f extended_hours=%s order_failure_cooldown=%.0f blocked_product_name_pattern=%r skip_when_asset_name_unavailable=%s sma200_sizing_enabled=%s sma200_min_multiplier=%.2f sma200_max_reduction_distance=%.2f sma50_sizing_enabled=%s sma50_full_size_distance=%.2f sma50_max_reduction_distance=%.2f sma50_min_multiplier=%.2f risk_gate_enabled=%s max_total_positions=%d red_exposure_pct=%.2f red_min_cash_pct=%.2f red_margin_use_pct=%.2f yellow_max_orders_per_cycle=%d yellow_order_fraction_multiplier=%.2f rank_candidates_enabled=%s reentry_guard_enabled=%s reentry_lookback_days=%d reentry_min_discount_pct=%.2f concentration_gate_enabled=%s risk_map_worksheet=%r unknown_policy=%s max_new_sector_day=%d max_new_group_day=%d max_open_sector=%d max_open_group=%d max_sector_exposure=%.2f max_group_exposure=%.2f stress_freeze_enabled=%s entry_log_worksheet=%r",
+        "Buyer service started version=%s sheet_id=%s worksheet=%s range=%s buy_score=%s order_fraction=%.4f paper=%s primary_buying_power_field=buying_power regt_fallback_fraction=%.2f steps=%s cycle_sleep=%.1f extended_hours=%s order_failure_cooldown=%.0f blocked_product_name_pattern=%r skip_when_asset_name_unavailable=%s sma200_sizing_enabled=%s sma200_min_multiplier=%.2f sma200_max_reduction_distance=%.2f sma50_sizing_enabled=%s sma50_full_size_distance=%.2f sma50_max_reduction_distance=%.2f sma50_min_multiplier=%.2f risk_gate_enabled=%s max_total_positions=%d red_exposure_pct=%.2f red_min_cash_pct=%.2f red_margin_use_pct=%.2f yellow_max_orders_per_cycle=%d yellow_order_fraction_multiplier=%.2f recovery_mode_enabled=%s recovery_max_exposure=%.2f recovery_min_cash=%.2f recovery_max_margin_use=%.2f recovery_max_entries_day=%d recovery_order_fraction_multiplier=%.2f rank_candidates_enabled=%s reentry_guard_enabled=%s reentry_lookback_days=%d reentry_min_discount_pct=%.2f concentration_gate_enabled=%s risk_map_worksheet=%r unknown_policy=%s max_new_sector_day=%d max_new_group_day=%d max_open_sector=%d max_open_group=%d max_sector_exposure=%.2f max_group_exposure=%.2f stress_freeze_enabled=%s entry_log_worksheet=%r",
         APP_VERSION,
         cfg.google_sheet_id,
         cfg.google_worksheet_name,
@@ -2372,6 +2564,12 @@ def buyer_loop() -> None:
         cfg.red_margin_use_pct,
         cfg.yellow_max_orders_per_cycle,
         cfg.yellow_order_fraction_multiplier,
+        cfg.recovery_mode_enabled,
+        cfg.recovery_max_exposure_pct,
+        cfg.recovery_min_cash_pct,
+        cfg.recovery_max_margin_use_pct,
+        cfg.recovery_max_new_entries_per_day,
+        cfg.recovery_order_fraction_multiplier,
         cfg.rank_candidates_enabled,
         cfg.reentry_guard_enabled,
         cfg.reentry_lookback_days,
