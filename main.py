@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from google.oauth2.service_account import Credentials
 
 
-APP_VERSION = "1.4.0-recovery-mode"
+APP_VERSION = "1.4.1-no-global-position-cap"
 
 
 # -----------------------------
@@ -111,6 +111,9 @@ class Config:
 
     # Portfolio risk gate / ranking / re-entry behavior
     risk_gate_enabled: bool
+    # Global position-count cap is opt-in. Exposure, cash, margin, sector,
+    # risk-group, and Recovery Mode controls remain active when disabled.
+    position_cap_enabled: bool
     max_total_positions: int
     yellow_exposure_pct: float
     red_exposure_pct: float
@@ -388,7 +391,8 @@ def load_config() -> Config:
         sma50_sizing_max_reduction_distance=getenv_float("SMA50_SIZING_MAX_REDUCTION_DISTANCE", 0.30),
         sma50_sizing_min_multiplier=getenv_float("SMA50_SIZING_MIN_MULTIPLIER", 0.50),
         risk_gate_enabled=getenv_bool("RISK_GATE_ENABLED", True),
-        max_total_positions=getenv_int("MAX_TOTAL_POSITIONS", 60),
+        position_cap_enabled=getenv_bool("POSITION_CAP_ENABLED", False),
+        max_total_positions=max(0, getenv_int("MAX_TOTAL_POSITIONS", 60)),
         yellow_exposure_pct=getenv_float("YELLOW_EXPOSURE_PCT", 0.75),
         red_exposure_pct=getenv_float("RED_EXPOSURE_PCT", 0.90),
         yellow_min_cash_pct=getenv_float("YELLOW_MIN_CASH_PCT", 0.07),
@@ -1528,8 +1532,13 @@ def build_risk_snapshot(
     green_position_count = sum(1 for p in positions if p.unrealized_plpc > 0 or p.unrealized_pl > 0)
     red_position_pct = positive_ratio(red_position_count, position_count)
 
-    if cfg.max_total_positions > 0:
-        available_position_slots = max(0, cfg.max_total_positions - position_count - open_buy_order_count)
+    # The global number-of-positions cap is disabled by default. When it is
+    # disabled, a large sentinel keeps the existing order-limit calculations
+    # compatible without preventing additional independent positions.
+    if cfg.position_cap_enabled and cfg.max_total_positions > 0:
+        available_position_slots = max(
+            0, cfg.max_total_positions - position_count - open_buy_order_count
+        )
     else:
         available_position_slots = 1_000_000
 
@@ -1554,7 +1563,11 @@ def build_risk_snapshot(
             hard_red_reasons.append("equity<=0")
         if buying_power <= 0:
             hard_red_reasons.append("buying_power<=0")
-        if cfg.max_total_positions > 0 and available_position_slots <= 0:
+        if (
+            cfg.position_cap_enabled
+            and cfg.max_total_positions > 0
+            and available_position_slots <= 0
+        ):
             hard_red_reasons.append(
                 f"position_cap_reached:{position_count}+{open_buy_order_count}>={cfg.max_total_positions}"
             )
@@ -2535,7 +2548,7 @@ def buyer_loop() -> None:
     cfg = load_config()
     set_state(started_at=now_iso())
     log.info(
-        "Buyer service started version=%s sheet_id=%s worksheet=%s range=%s buy_score=%s order_fraction=%.4f paper=%s primary_buying_power_field=buying_power regt_fallback_fraction=%.2f steps=%s cycle_sleep=%.1f extended_hours=%s order_failure_cooldown=%.0f blocked_product_name_pattern=%r skip_when_asset_name_unavailable=%s sma200_sizing_enabled=%s sma200_min_multiplier=%.2f sma200_max_reduction_distance=%.2f sma50_sizing_enabled=%s sma50_full_size_distance=%.2f sma50_max_reduction_distance=%.2f sma50_min_multiplier=%.2f risk_gate_enabled=%s max_total_positions=%d red_exposure_pct=%.2f red_min_cash_pct=%.2f red_margin_use_pct=%.2f yellow_max_orders_per_cycle=%d yellow_order_fraction_multiplier=%.2f recovery_mode_enabled=%s recovery_max_exposure=%.2f recovery_min_cash=%.2f recovery_max_margin_use=%.2f recovery_max_entries_day=%d recovery_order_fraction_multiplier=%.2f rank_candidates_enabled=%s reentry_guard_enabled=%s reentry_lookback_days=%d reentry_min_discount_pct=%.2f concentration_gate_enabled=%s risk_map_worksheet=%r unknown_policy=%s max_new_sector_day=%d max_new_group_day=%d max_open_sector=%d max_open_group=%d max_sector_exposure=%.2f max_group_exposure=%.2f stress_freeze_enabled=%s entry_log_worksheet=%r",
+        "Buyer service started version=%s sheet_id=%s worksheet=%s range=%s buy_score=%s order_fraction=%.4f paper=%s primary_buying_power_field=buying_power regt_fallback_fraction=%.2f steps=%s cycle_sleep=%.1f extended_hours=%s order_failure_cooldown=%.0f blocked_product_name_pattern=%r skip_when_asset_name_unavailable=%s sma200_sizing_enabled=%s sma200_min_multiplier=%.2f sma200_max_reduction_distance=%.2f sma50_sizing_enabled=%s sma50_full_size_distance=%.2f sma50_max_reduction_distance=%.2f sma50_min_multiplier=%.2f risk_gate_enabled=%s position_cap_enabled=%s max_total_positions=%d red_exposure_pct=%.2f red_min_cash_pct=%.2f red_margin_use_pct=%.2f yellow_max_orders_per_cycle=%d yellow_order_fraction_multiplier=%.2f recovery_mode_enabled=%s recovery_max_exposure=%.2f recovery_min_cash=%.2f recovery_max_margin_use=%.2f recovery_max_entries_day=%d recovery_order_fraction_multiplier=%.2f rank_candidates_enabled=%s reentry_guard_enabled=%s reentry_lookback_days=%d reentry_min_discount_pct=%.2f concentration_gate_enabled=%s risk_map_worksheet=%r unknown_policy=%s max_new_sector_day=%d max_new_group_day=%d max_open_sector=%d max_open_group=%d max_sector_exposure=%.2f max_group_exposure=%.2f stress_freeze_enabled=%s entry_log_worksheet=%r",
         APP_VERSION,
         cfg.google_sheet_id,
         cfg.google_worksheet_name,
@@ -2558,6 +2571,7 @@ def buyer_loop() -> None:
         cfg.sma50_sizing_max_reduction_distance,
         cfg.sma50_sizing_min_multiplier,
         cfg.risk_gate_enabled,
+        cfg.position_cap_enabled,
         cfg.max_total_positions,
         cfg.red_exposure_pct,
         cfg.red_min_cash_pct,
