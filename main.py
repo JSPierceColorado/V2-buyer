@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from google.oauth2.service_account import Credentials
 
 
-APP_VERSION = "1.4.1-no-global-position-cap"
+APP_VERSION = "1.4.2-market-order-guards"
 
 
 # -----------------------------
@@ -98,6 +98,7 @@ class Config:
     cycle_sleep_seconds: float
     regt_fallback_fraction: float
     extended_hours: bool
+    market_open_check_enabled: bool
     blocked_product_name_pattern: str
     skip_when_asset_name_unavailable: bool
     sma200_sizing_enabled: bool
@@ -171,6 +172,7 @@ class Config:
     order_poll_interval_seconds: float
     treat_partial_fill_as_success: bool
     order_failure_cooldown_seconds: float
+    unfilled_order_cooldown_seconds: float
     error_body_max_chars: int
 
     # HTTP/retry behavior
@@ -217,6 +219,22 @@ class RecentSellFill:
     price: float
     qty: float
     transaction_time: str
+
+
+@dataclass(frozen=True)
+class MarketClockSnapshot:
+    is_open: bool
+    timestamp: str
+    next_open: str
+    next_close: str
+
+
+@dataclass(frozen=True)
+class OpenOrderSymbols:
+    all_symbols: Set[str]
+    buy_symbols: Set[str]
+    sell_symbols: Set[str]
+    other_symbols: Set[str]
 
 
 @dataclass(frozen=True)
@@ -377,6 +395,7 @@ def load_config() -> Config:
         cycle_sleep_seconds=getenv_float("CYCLE_SLEEP_SECONDS", 10.0),
         regt_fallback_fraction=regt_fallback_fraction,
         extended_hours=getenv_bool("EXTENDED_HOURS", False),
+        market_open_check_enabled=getenv_bool("MARKET_OPEN_CHECK_ENABLED", True),
         blocked_product_name_pattern=os.getenv(
             "BLOCK_PRODUCT_NAME_PATTERN",
             r"\b(daily|inverse|2\s*x|3\s*x)\b",
@@ -443,6 +462,7 @@ def load_config() -> Config:
         order_poll_interval_seconds=getenv_float("ORDER_POLL_INTERVAL_SECONDS", 2.0),
         treat_partial_fill_as_success=getenv_bool("TREAT_PARTIAL_FILL_AS_SUCCESS", True),
         order_failure_cooldown_seconds=getenv_float("ORDER_FAILURE_COOLDOWN_SECONDS", 1800.0),
+        unfilled_order_cooldown_seconds=getenv_float("ORDER_UNFILLED_COOLDOWN_SECONDS", 1800.0),
         error_body_max_chars=getenv_int("ERROR_BODY_MAX_CHARS", 800),
         request_timeout_seconds=getenv_float("REQUEST_TIMEOUT_SECONDS", 10.0),
         request_retries=getenv_int("REQUEST_RETRIES", 3),
@@ -510,6 +530,19 @@ _state: Dict[str, Any] = {
     "last_largest_risk_group_exposure_pct": 0.0,
     "last_entry_log_rows": 0,
     "last_order_submit_failures": 0,
+    "last_market_is_open": None,
+    "last_market_clock_timestamp": None,
+    "last_market_next_open": None,
+    "last_market_next_close": None,
+    "last_market_gate_reason": None,
+    "last_open_order_symbols": [],
+    "last_open_buy_order_symbols": [],
+    "last_open_sell_order_symbols": [],
+    "last_skipped_market_closed": 0,
+    "last_skipped_open_buy_order": 0,
+    "last_skipped_open_sell_order": 0,
+    "last_skipped_open_other_order": 0,
+    "last_unfilled_cooldowns_set": 0,
 }
 _order_failure_cooldowns: Dict[str, Tuple[float, str]] = {}
 _equity_high_watermark: float = 0.0
@@ -1361,6 +1394,40 @@ def set_concentration_state(
 # -----------------------------
 
 
+def get_market_clock(session: requests.Session, cfg: Config) -> MarketClockSnapshot:
+    payload = http_get(session, f"{cfg.trading_base_url}/v2/clock", cfg)
+    if not isinstance(payload, dict) or "is_open" not in payload:
+        raise RuntimeError("Alpaca clock response was missing is_open")
+    return MarketClockSnapshot(
+        is_open=bool(payload.get("is_open")),
+        timestamp=str(payload.get("timestamp") or ""),
+        next_open=str(payload.get("next_open") or ""),
+        next_close=str(payload.get("next_close") or ""),
+    )
+
+
+def set_market_clock_state(clock: MarketClockSnapshot, reason: str) -> None:
+    set_state(
+        last_market_is_open=clock.is_open,
+        last_market_clock_timestamp=clock.timestamp,
+        last_market_next_open=clock.next_open,
+        last_market_next_close=clock.next_close,
+        last_market_gate_reason=reason,
+    )
+
+
+def require_market_open(session: requests.Session, cfg: Config, context: str) -> MarketClockSnapshot:
+    if not cfg.market_open_check_enabled:
+        clock = MarketClockSnapshot(True, now_iso(), "", "")
+        set_market_clock_state(clock, "market_open_check_disabled")
+        return clock
+
+    clock = get_market_clock(session, cfg)
+    reason = "market_open" if clock.is_open else f"market_closed:{context}"
+    set_market_clock_state(clock, reason)
+    return clock
+
+
 def get_account(session: requests.Session, cfg: Config) -> Dict[str, Any]:
     return http_get(session, f"{cfg.trading_base_url}/v2/account", cfg)
 
@@ -1385,14 +1452,11 @@ def should_retry_with_regt(attempt: OrderAttemptResult) -> bool:
 
 
 def list_positions(session: requests.Session, cfg: Config) -> List[PositionSnapshot]:
-    try:
-        positions = http_get(session, f"{cfg.trading_base_url}/v2/positions", cfg)
-    except Exception as exc:
-        # Alpaca returns an empty list when no positions in normal operation; this is just defensive.
-        log.warning("Could not list positions: %s", exc)
-        return []
+    # Fail closed. Treating an API error as an empty account could permit a
+    # duplicate buy in a symbol that is already held.
+    positions = http_get(session, f"{cfg.trading_base_url}/v2/positions", cfg)
     if not isinstance(positions, list):
-        return []
+        raise RuntimeError("Alpaca positions response was not a list")
 
     result: List[PositionSnapshot] = []
     for p in positions:
@@ -1414,24 +1478,62 @@ def list_positions(session: requests.Session, cfg: Config) -> List[PositionSnaps
 
 
 def list_position_symbols(session: requests.Session, cfg: Config) -> Set[str]:
-    positions = list_positions(session, cfg)
-    if not positions:
-        return set()
-    return {p.symbol for p in positions}
+    return {p.symbol for p in list_positions(session, cfg)}
 
 
-def list_open_buy_order_symbols(session: requests.Session, cfg: Config) -> Set[str]:
+def list_open_order_symbols(session: requests.Session, cfg: Config) -> OpenOrderSymbols:
+    # Query every open order, not only buys. A pending sell must also block a
+    # new buy so the Buyer cannot race the Seller or Manager on the same symbol.
     params = {"status": "open", "limit": 500, "direction": "desc"}
     orders = http_get(session, f"{cfg.trading_base_url}/v2/orders", cfg, params=params)
     if not isinstance(orders, list):
-        return set()
-    result = set()
+        raise RuntimeError("Alpaca open-orders response was not a list")
+
+    all_symbols: Set[str] = set()
+    buy_symbols: Set[str] = set()
+    sell_symbols: Set[str] = set()
+    other_symbols: Set[str] = set()
+
     for order in orders:
-        if str(order.get("side", "")).lower() == "buy":
-            sym = clean_symbol(order.get("symbol"))
-            if sym:
-                result.add(sym)
-    return result
+        if not isinstance(order, dict):
+            continue
+        symbol = clean_symbol(order.get("symbol"))
+        if not symbol:
+            continue
+        side = str(order.get("side") or "").strip().lower()
+        all_symbols.add(symbol)
+        if side == "buy":
+            buy_symbols.add(symbol)
+        elif side == "sell":
+            sell_symbols.add(symbol)
+        else:
+            other_symbols.add(symbol)
+
+    snapshot = OpenOrderSymbols(
+        all_symbols=all_symbols,
+        buy_symbols=buy_symbols,
+        sell_symbols=sell_symbols,
+        other_symbols=other_symbols,
+    )
+    set_state(
+        last_open_order_symbols=sorted(snapshot.all_symbols),
+        last_open_buy_order_symbols=sorted(snapshot.buy_symbols),
+        last_open_sell_order_symbols=sorted(snapshot.sell_symbols),
+    )
+    return snapshot
+
+
+def open_order_block_reason(symbol: str, open_orders: OpenOrderSymbols) -> Optional[str]:
+    symbol = clean_symbol(symbol)
+    if symbol in open_orders.buy_symbols and symbol in open_orders.sell_symbols:
+        return "open_buy_and_sell_orders"
+    if symbol in open_orders.sell_symbols:
+        return "open_sell_order"
+    if symbol in open_orders.buy_symbols:
+        return "open_buy_order"
+    if symbol in open_orders.other_symbols:
+        return "open_other_order"
+    return None
 
 
 def positive_ratio(numerator: float, denominator: float) -> float:
@@ -1955,6 +2057,19 @@ def place_best_bid_chasing_order(session: requests.Session, cfg: Config, symbol:
     last_order_id: Optional[str] = None
 
     for idx, step_fraction in enumerate(cfg.bid_to_market_steps):
+        clock = require_market_open(session, cfg, f"chase_step_{idx}")
+        if not clock.is_open:
+            maybe_cancel_live_order(session, cfg, last_order_id, symbol, "market closed during chase")
+            message = (
+                f"market closed during chase timestamp={clock.timestamp} "
+                f"next_open={clock.next_open}"
+            )
+            log.warning("Stopping BUY chase for %s: %s", symbol, message)
+            return OrderAttemptResult(
+                filled_or_partial=False,
+                submitted=last_order_id is not None,
+                failure_message=message,
+            )
         elapsed = time.time() - started
         if elapsed >= cfg.total_chase_timeout_seconds:
             log.warning("Total chase timeout reached for %s after %.1fs", symbol, elapsed)
@@ -2069,7 +2184,29 @@ def process_cycle(
     risk_map_ws: gspread.Worksheet,
     cfg: Config,
 ) -> None:
-    set_state(last_cycle_started_at=now_iso(), last_error=None)
+    set_state(
+        last_cycle_started_at=now_iso(),
+        last_error=None,
+        last_skipped_market_closed=0,
+        last_market_gate_reason=None,
+    )
+
+    clock = require_market_open(session, cfg, "cycle_start")
+    if not clock.is_open:
+        log.info(
+            "Market is closed; skipping Buyer cycle timestamp=%s next_open=%s next_close=%s",
+            clock.timestamp,
+            clock.next_open,
+            clock.next_close,
+        )
+        set_state(
+            last_cycle_finished_at=now_iso(),
+            last_candidates=0,
+            last_orders_submitted=0,
+            last_orders_filled_or_partial=0,
+            last_skipped_market_closed=1,
+        )
+        return
 
     candidates = read_buy_candidates(ws, cfg)
     candidates = ranked_buy_candidates(candidates, cfg)
@@ -2083,12 +2220,12 @@ def process_cycle(
     account = get_account(session, cfg)
     position_snapshots = list_positions(session, cfg)
     positions = {p.symbol for p in position_snapshots}
-    open_buy_orders = list_open_buy_order_symbols(session, cfg)
+    open_orders = list_open_order_symbols(session, cfg)
     successful_entries_today = count_today_successful_entries(entry_log_ws, cfg)
     risk = build_risk_snapshot(
         account,
         position_snapshots,
-        open_buy_orders,
+        open_orders.buy_symbols,
         cfg,
         successful_entries_today=successful_entries_today,
     )
@@ -2100,7 +2237,7 @@ def process_cycle(
     set_state(last_concentration_gate_block_reason=None)
 
     log.info(
-        "Risk gate mode=%s reasons=%s equity=%.2f cash_pct=%.2f%% exposure_pct=%.2f%% margin_use_pct=%.2f%% drawdown_pct=%.2f%% positions=%d open_buy_orders=%d red/green=%d/%d available_slots=%d max_new_orders_this_cycle=%d order_fraction_multiplier=%.2f recovery_entries_today=%d recovery_entries_remaining=%d",
+        "Risk gate mode=%s reasons=%s equity=%.2f cash_pct=%.2f%% exposure_pct=%.2f%% margin_use_pct=%.2f%% drawdown_pct=%.2f%% positions=%d open_orders=%d open_buy_orders=%d open_sell_orders=%d red/green=%d/%d available_slots=%d max_new_orders_this_cycle=%d order_fraction_multiplier=%.2f recovery_entries_today=%d recovery_entries_remaining=%d",
         risk.mode,
         ";".join(risk.reasons),
         risk.equity,
@@ -2109,7 +2246,9 @@ def process_cycle(
         risk.margin_use_pct * 100,
         risk.drawdown_pct * 100,
         risk.position_count,
-        risk.open_buy_order_count,
+        len(open_orders.all_symbols),
+        len(open_orders.buy_symbols),
+        len(open_orders.sell_symbols),
         risk.red_position_count,
         risk.green_position_count,
         risk.available_position_slots,
@@ -2133,6 +2272,9 @@ def process_cycle(
     orders_submitted = 0
     filled_or_partial = 0
     skipped_existing = 0
+    skipped_open_buy_order = 0
+    skipped_open_sell_order = 0
+    skipped_open_other_order = 0
     skipped_notional = 0
     skipped_recent_failures = 0
     skipped_product_name_block = 0
@@ -2143,6 +2285,7 @@ def process_cycle(
     concentration_skips: CounterType[str] = Counter()
     entry_log_rows = 0
     order_submit_failures = 0
+    unfilled_cooldowns_set = 0
 
     def finish_cycle() -> None:
         set_concentration_state(concentration, len(risk_map), risk.equity)
@@ -2152,6 +2295,9 @@ def process_cycle(
             last_orders_submitted=orders_submitted,
             last_orders_filled_or_partial=filled_or_partial,
             last_skipped_existing=skipped_existing,
+            last_skipped_open_buy_order=skipped_open_buy_order,
+            last_skipped_open_sell_order=skipped_open_sell_order,
+            last_skipped_open_other_order=skipped_open_other_order,
             last_skipped_notional=skipped_notional,
             last_skipped_recent_failures=skipped_recent_failures,
             last_skipped_product_name_block=skipped_product_name_block,
@@ -2172,6 +2318,7 @@ def process_cycle(
             last_skipped_group_stress=concentration_skips["skipped_group_stress"],
             last_entry_log_rows=entry_log_rows,
             last_order_submit_failures=order_submit_failures,
+            last_unfilled_cooldowns_set=unfilled_cooldowns_set,
         )
 
     if risk.max_new_orders_this_cycle <= 0:
@@ -2231,12 +2378,21 @@ def process_cycle(
             skipped_recent_failures += 1
             continue
 
+        order_block = open_order_block_reason(symbol, open_orders)
+        if order_block:
+            log.info("Skipping %s: %s already exists in Alpaca", symbol, order_block)
+            skipped_existing += 1
+            if order_block == "open_sell_order":
+                skipped_open_sell_order += 1
+            elif order_block in {"open_buy_order", "open_buy_and_sell_orders"}:
+                skipped_open_buy_order += 1
+                if order_block == "open_buy_and_sell_orders":
+                    skipped_open_sell_order += 1
+            else:
+                skipped_open_other_order += 1
+            continue
         if symbol in positions:
             log.info("Skipping %s: already held in Alpaca account", symbol)
-            skipped_existing += 1
-            continue
-        if symbol in open_buy_orders:
-            log.info("Skipping %s: open buy order already exists", symbol)
             skipped_existing += 1
             continue
 
@@ -2374,6 +2530,40 @@ def process_cycle(
                 concentration_check.sector_daily_notional_pct_before * 100,
                 concentration_check.group_daily_notional_pct_before * 100,
             )
+            continue
+
+        # Re-check immediately before submission. Positions and orders can
+        # change while this cycle is ranking/sizing candidates because Seller
+        # and Manager services operate concurrently.
+        clock = require_market_open(session, cfg, f"pre_submit:{symbol}")
+        if not clock.is_open:
+            log.warning(
+                "Market closed before BUY submission for %s timestamp=%s next_open=%s; ending cycle",
+                symbol,
+                clock.timestamp,
+                clock.next_open,
+            )
+            break
+
+        latest_positions = list_positions(session, cfg)
+        positions = {p.symbol for p in latest_positions}
+        open_orders = list_open_order_symbols(session, cfg)
+        order_block = open_order_block_reason(symbol, open_orders)
+        if order_block:
+            log.info("Skipping %s at pre-submit recheck: %s", symbol, order_block)
+            skipped_existing += 1
+            if order_block == "open_sell_order":
+                skipped_open_sell_order += 1
+            elif order_block in {"open_buy_order", "open_buy_and_sell_orders"}:
+                skipped_open_buy_order += 1
+                if order_block == "open_buy_and_sell_orders":
+                    skipped_open_sell_order += 1
+            else:
+                skipped_open_other_order += 1
+            continue
+        if symbol in positions:
+            log.info("Skipping %s at pre-submit recheck: position now exists", symbol)
+            skipped_existing += 1
             continue
 
         log.info(
@@ -2514,23 +2704,33 @@ def process_cycle(
                     attempt.failure_status,
                     attempt.failure_message,
                 )
-            try:
-                open_buy_orders = list_open_buy_order_symbols(session, cfg)
-            except Exception as exc:
-                log.warning(
-                    "Could not refresh open buy orders after failed attempt for %s: %s",
-                    symbol,
-                    exc,
+            elif attempt.submitted and cfg.unfilled_order_cooldown_seconds > 0:
+                _order_failure_cooldowns[symbol] = (
+                    time.time() + cfg.unfilled_order_cooldown_seconds,
+                    "submitted_but_unfilled",
                 )
+                unfilled_cooldowns_set += 1
+                log.info(
+                    "Unfilled-order cooldown set for %s seconds=%.0f",
+                    symbol,
+                    cfg.unfilled_order_cooldown_seconds,
+                )
+
+            # Refresh all open orders. Any surviving buy or sell order must
+            # block another attempt in this cycle and in following cycles.
+            open_orders = list_open_order_symbols(session, cfg)
 
     finish_cycle()
     log.info(
-        "Cycle complete risk_mode=%s candidates=%d orders_submitted=%d filled_or_partial=%d skipped_existing=%d skipped_notional=%d skipped_recent_failures=%d skipped_reentry_guard=%d skipped_unknown_classification=%d concentration_skips=%s skipped_product_name_block=%d skipped_asset_lookup=%d skipped_entry_sized_below_min=%d entry_log_rows=%d order_submit_failures=%d",
+        "Cycle complete risk_mode=%s candidates=%d orders_submitted=%d filled_or_partial=%d skipped_existing=%d skipped_open_buy_order=%d skipped_open_sell_order=%d skipped_open_other_order=%d skipped_notional=%d skipped_recent_failures=%d skipped_reentry_guard=%d skipped_unknown_classification=%d concentration_skips=%s skipped_product_name_block=%d skipped_asset_lookup=%d skipped_entry_sized_below_min=%d entry_log_rows=%d order_submit_failures=%d unfilled_cooldowns_set=%d",
         risk.mode,
         len(candidates),
         orders_submitted,
         filled_or_partial,
         skipped_existing,
+        skipped_open_buy_order,
+        skipped_open_sell_order,
+        skipped_open_other_order,
         skipped_notional,
         skipped_recent_failures,
         skipped_reentry_guard,
@@ -2541,6 +2741,7 @@ def process_cycle(
         skipped_entry_sized_below_min,
         entry_log_rows,
         order_submit_failures,
+        unfilled_cooldowns_set,
     )
 
 
@@ -2548,7 +2749,7 @@ def buyer_loop() -> None:
     cfg = load_config()
     set_state(started_at=now_iso())
     log.info(
-        "Buyer service started version=%s sheet_id=%s worksheet=%s range=%s buy_score=%s order_fraction=%.4f paper=%s primary_buying_power_field=buying_power regt_fallback_fraction=%.2f steps=%s cycle_sleep=%.1f extended_hours=%s order_failure_cooldown=%.0f blocked_product_name_pattern=%r skip_when_asset_name_unavailable=%s sma200_sizing_enabled=%s sma200_min_multiplier=%.2f sma200_max_reduction_distance=%.2f sma50_sizing_enabled=%s sma50_full_size_distance=%.2f sma50_max_reduction_distance=%.2f sma50_min_multiplier=%.2f risk_gate_enabled=%s position_cap_enabled=%s max_total_positions=%d red_exposure_pct=%.2f red_min_cash_pct=%.2f red_margin_use_pct=%.2f yellow_max_orders_per_cycle=%d yellow_order_fraction_multiplier=%.2f recovery_mode_enabled=%s recovery_max_exposure=%.2f recovery_min_cash=%.2f recovery_max_margin_use=%.2f recovery_max_entries_day=%d recovery_order_fraction_multiplier=%.2f rank_candidates_enabled=%s reentry_guard_enabled=%s reentry_lookback_days=%d reentry_min_discount_pct=%.2f concentration_gate_enabled=%s risk_map_worksheet=%r unknown_policy=%s max_new_sector_day=%d max_new_group_day=%d max_open_sector=%d max_open_group=%d max_sector_exposure=%.2f max_group_exposure=%.2f stress_freeze_enabled=%s entry_log_worksheet=%r",
+        "Buyer service started version=%s sheet_id=%s worksheet=%s range=%s buy_score=%s order_fraction=%.4f paper=%s primary_buying_power_field=buying_power regt_fallback_fraction=%.2f steps=%s cycle_sleep=%.1f extended_hours=%s market_open_check_enabled=%s order_failure_cooldown=%.0f unfilled_order_cooldown=%.0f blocked_product_name_pattern=%r skip_when_asset_name_unavailable=%s sma200_sizing_enabled=%s sma200_min_multiplier=%.2f sma200_max_reduction_distance=%.2f sma50_sizing_enabled=%s sma50_full_size_distance=%.2f sma50_max_reduction_distance=%.2f sma50_min_multiplier=%.2f risk_gate_enabled=%s position_cap_enabled=%s max_total_positions=%d red_exposure_pct=%.2f red_min_cash_pct=%.2f red_margin_use_pct=%.2f yellow_max_orders_per_cycle=%d yellow_order_fraction_multiplier=%.2f recovery_mode_enabled=%s recovery_max_exposure=%.2f recovery_min_cash=%.2f recovery_max_margin_use=%.2f recovery_max_entries_day=%d recovery_order_fraction_multiplier=%.2f rank_candidates_enabled=%s reentry_guard_enabled=%s reentry_lookback_days=%d reentry_min_discount_pct=%.2f concentration_gate_enabled=%s risk_map_worksheet=%r unknown_policy=%s max_new_sector_day=%d max_new_group_day=%d max_open_sector=%d max_open_group=%d max_sector_exposure=%.2f max_group_exposure=%.2f stress_freeze_enabled=%s entry_log_worksheet=%r",
         APP_VERSION,
         cfg.google_sheet_id,
         cfg.google_worksheet_name,
@@ -2560,7 +2761,9 @@ def buyer_loop() -> None:
         cfg.bid_to_market_steps,
         cfg.cycle_sleep_seconds,
         cfg.extended_hours,
+        cfg.market_open_check_enabled,
         cfg.order_failure_cooldown_seconds,
+        cfg.unfilled_order_cooldown_seconds,
         cfg.blocked_product_name_pattern,
         cfg.skip_when_asset_name_unavailable,
         cfg.sma200_sizing_enabled,
