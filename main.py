@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from google.oauth2.service_account import Credentials
 
 
-APP_VERSION = "1.4.2-market-order-guards"
+APP_VERSION = "1.5.0-sector-auto"
 
 
 # -----------------------------
@@ -113,7 +113,7 @@ class Config:
     # Portfolio risk gate / ranking / re-entry behavior
     risk_gate_enabled: bool
     # Global position-count cap is opt-in. Exposure, cash, margin, sector,
-    # risk-group, and Recovery Mode controls remain active when disabled.
+    # and Recovery Mode controls remain active when disabled.
     position_cap_enabled: bool
     max_total_positions: int
     yellow_exposure_pct: float
@@ -147,23 +147,27 @@ class Config:
     reentry_allow_in_yellow: bool
     reentry_allow_without_sell_price: bool
 
-    # Sector / correlated-risk concentration protection
+    # Sector-only concentration protection with automatic classification
     concentration_gate_enabled: bool
-    risk_map_worksheet_name: str
-    unknown_classification_policy: str
     market_timezone: str
     max_new_per_sector_per_day: int
-    max_new_per_risk_group_per_day: int
     max_open_positions_per_sector: int
-    max_open_positions_per_risk_group: int
     max_sector_exposure_pct: float
-    max_risk_group_exposure_pct: float
     max_daily_sector_notional_pct: float
-    max_daily_risk_group_notional_pct: float
     stress_freeze_enabled: bool
     stress_min_open_positions: int
     stress_red_position_pct: float
     stress_aggregate_return_pct: float
+
+    # Automatic sector resolver / persistent cache
+    auto_sector_enabled: bool
+    sector_cache_worksheet_name: str
+    legacy_risk_map_worksheet_name: str
+    sector_cache_ttl_days: int
+    sector_lookup_max_per_cycle: int
+    sector_lookup_retry_seconds: float
+    fmp_api_key: str
+    fmp_profile_url: str
 
     # Chasing behavior
     bid_to_market_steps: Tuple[float, ...]
@@ -261,10 +265,35 @@ class RiskSnapshot:
 
 
 @dataclass(frozen=True)
-class SymbolClassification:
+class SectorClassification:
     symbol: str
     sector: str
-    risk_group: str
+    source: str = ""
+    resolved_at: str = ""
+    asset_name: str = ""
+
+
+@dataclass(frozen=True)
+class SectorCacheEntry:
+    symbol: str
+    sector: str
+    source: str
+    resolved_at: str
+    last_checked_at: str
+    asset_name: str
+    manual_override: bool
+    last_error: str
+    row_num: int = 0
+
+
+@dataclass(frozen=True)
+class SectorResolutionSummary:
+    cache_hits: int
+    stale_cache_used: int
+    auto_resolved: int
+    unresolved: int
+    provider_errors: int
+    lookups_attempted: int
 
 
 @dataclass
@@ -288,11 +317,8 @@ class BucketStats:
 @dataclass
 class ConcentrationState:
     sector_stats: Dict[str, BucketStats]
-    group_stats: Dict[str, BucketStats]
     daily_sector_entries: CounterType[str]
-    daily_group_entries: CounterType[str]
     daily_sector_notional: CounterType[str]
-    daily_group_notional: CounterType[str]
     unknown_position_symbols: Set[str]
 
 
@@ -301,17 +327,11 @@ class ConcentrationCheck:
     allowed: bool
     reason: str
     sector: str
-    risk_group: str
     sector_position_count_before: int
-    group_position_count_before: int
     sector_exposure_pct_before: float
-    group_exposure_pct_before: float
     sector_entries_today: int
-    group_entries_today: int
     sector_daily_notional_pct_before: float
-    group_daily_notional_pct_before: float
     sector_stressed: bool
-    group_stressed: bool
 
 
 class HttpStatusError(RuntimeError):
@@ -364,9 +384,6 @@ def load_config() -> Config:
     if regt_fallback_fraction <= 0:
         raise RuntimeError("REGT_FALLBACK_FRACTION must be greater than 0")
 
-    unknown_classification_policy = os.getenv("UNKNOWN_CLASSIFICATION_POLICY", "skip").strip().lower()
-    if unknown_classification_policy not in {"skip", "bucket"}:
-        raise RuntimeError("UNKNOWN_CLASSIFICATION_POLICY must be 'skip' or 'bucket'")
 
     return Config(
         google_service_account_json=google_service_account_json,
@@ -441,21 +458,31 @@ def load_config() -> Config:
         reentry_allow_in_yellow=getenv_bool("REENTRY_ALLOW_IN_YELLOW", False),
         reentry_allow_without_sell_price=getenv_bool("REENTRY_ALLOW_WITHOUT_SELL_PRICE", False),
         concentration_gate_enabled=getenv_bool("CONCENTRATION_GATE_ENABLED", True),
-        risk_map_worksheet_name=os.getenv("RISK_MAP_WORKSHEET_NAME", "Symbol Risk Map").strip() or "Symbol Risk Map",
-        unknown_classification_policy=unknown_classification_policy,
         market_timezone=os.getenv("MARKET_TIMEZONE", "America/New_York").strip() or "America/New_York",
         max_new_per_sector_per_day=max(0, getenv_int("MAX_NEW_PER_SECTOR_PER_DAY", 1)),
-        max_new_per_risk_group_per_day=max(0, getenv_int("MAX_NEW_PER_RISK_GROUP_PER_DAY", 1)),
         max_open_positions_per_sector=max(0, getenv_int("MAX_OPEN_POSITIONS_PER_SECTOR", 5)),
-        max_open_positions_per_risk_group=max(0, getenv_int("MAX_OPEN_POSITIONS_PER_RISK_GROUP", 3)),
         max_sector_exposure_pct=max(0.0, getenv_float("MAX_SECTOR_EXPOSURE_PCT", 0.15)),
-        max_risk_group_exposure_pct=max(0.0, getenv_float("MAX_RISK_GROUP_EXPOSURE_PCT", 0.08)),
         max_daily_sector_notional_pct=max(0.0, getenv_float("MAX_DAILY_SECTOR_NOTIONAL_PCT", 0.03)),
-        max_daily_risk_group_notional_pct=max(0.0, getenv_float("MAX_DAILY_RISK_GROUP_NOTIONAL_PCT", 0.02)),
         stress_freeze_enabled=getenv_bool("STRESS_FREEZE_ENABLED", True),
         stress_min_open_positions=max(1, getenv_int("STRESS_MIN_OPEN_POSITIONS", 3)),
         stress_red_position_pct=clamp(getenv_float("STRESS_RED_POSITION_PCT", 0.60), 0.0, 1.0),
         stress_aggregate_return_pct=-abs(getenv_float("STRESS_AGGREGATE_RETURN_PCT", -0.015)),
+        auto_sector_enabled=getenv_bool("AUTO_SECTOR_ENABLED", True),
+        sector_cache_worksheet_name=(
+            os.getenv("SECTOR_CACHE_WORKSHEET_NAME", "Symbol Sector Cache").strip()
+            or "Symbol Sector Cache"
+        ),
+        legacy_risk_map_worksheet_name=(
+            os.getenv("LEGACY_RISK_MAP_WORKSHEET_NAME", "Symbol Risk Map").strip()
+        ),
+        sector_cache_ttl_days=max(1, getenv_int("SECTOR_CACHE_TTL_DAYS", 90)),
+        sector_lookup_max_per_cycle=max(0, getenv_int("SECTOR_LOOKUP_MAX_PER_CYCLE", 50)),
+        sector_lookup_retry_seconds=max(0.0, getenv_float("SECTOR_LOOKUP_RETRY_SECONDS", 21600.0)),
+        fmp_api_key=os.getenv("FMP_API_KEY", "").strip(),
+        fmp_profile_url=(
+            os.getenv("FMP_PROFILE_URL", "https://financialmodelingprep.com/stable/profile").strip()
+            or "https://financialmodelingprep.com/stable/profile"
+        ),
         bid_to_market_steps=steps,
         step_timeout_seconds=getenv_float("STEP_TIMEOUT_SECONDS", 5.0),
         total_chase_timeout_seconds=getenv_float("TOTAL_CHASE_TIMEOUT_SECONDS", 30.0),
@@ -496,17 +523,12 @@ _state: Dict[str, Any] = {
     "last_skipped_sma200_sized_below_min": 0,
     "last_skipped_entry_sized_below_min": 0,
     "last_skipped_reentry_guard": 0,
-    "last_skipped_unknown_classification": 0,
+    "last_skipped_unresolved_sector": 0,
     "last_skipped_sector_daily_limit": 0,
-    "last_skipped_group_daily_limit": 0,
     "last_skipped_sector_position_limit": 0,
-    "last_skipped_group_position_limit": 0,
     "last_skipped_sector_exposure": 0,
-    "last_skipped_group_exposure": 0,
     "last_skipped_sector_daily_notional": 0,
-    "last_skipped_group_daily_notional": 0,
     "last_skipped_sector_stress": 0,
-    "last_skipped_group_stress": 0,
     "last_risk_mode": None,
     "last_risk_reasons": [],
     "last_position_count": 0,
@@ -521,13 +543,17 @@ _state: Dict[str, Any] = {
     "last_red_position_pct": 0.0,
     "last_recovery_entries_today": 0,
     "last_recovery_entries_remaining": 0,
-    "last_risk_map_symbols": 0,
-    "last_unknown_position_symbols": [],
+    "last_sector_cache_symbols": 0,
+    "last_unresolved_position_symbols": [],
+    "last_unresolved_candidate_symbols": [],
+    "last_sector_cache_hits": 0,
+    "last_sector_stale_cache_used": 0,
+    "last_sector_auto_resolved": 0,
+    "last_sector_provider_errors": 0,
+    "last_sector_lookups_attempted": 0,
     "last_concentration_gate_block_reason": None,
     "last_largest_sector": None,
     "last_largest_sector_exposure_pct": 0.0,
-    "last_largest_risk_group": None,
-    "last_largest_risk_group_exposure_pct": 0.0,
     "last_entry_log_rows": 0,
     "last_order_submit_failures": 0,
     "last_market_is_open": None,
@@ -780,7 +806,7 @@ ENTRY_LOG_HEADERS = [
     "recovery_entries_remaining",
 ]
 
-RISK_MAP_HEADERS = ["symbol", "sector", "risk_group"]
+SECTOR_CACHE_HEADERS = ["symbol", "sector", "source", "resolved_at", "last_checked_at", "asset_name", "manual_override", "last_error"]
 
 
 def open_or_create_worksheet(gc: gspread.Client, cfg: Config, title: str, headers: Sequence[str]) -> gspread.Worksheet:
@@ -802,6 +828,18 @@ def open_or_create_worksheet(gc: gspread.Client, cfg: Config, title: str, header
         log.warning("Could not initialize headers on worksheet %r: %s", title, exc)
 
     return ws
+
+
+def open_optional_worksheet(
+    gc: gspread.Client, cfg: Config, title: str
+) -> Optional[gspread.Worksheet]:
+    if not title:
+        return None
+    sheet = gc.open_by_key(cfg.google_sheet_id)
+    try:
+        return sheet.worksheet(title)
+    except WorksheetNotFound:
+        return None
 
 
 def read_buy_candidates(ws: gspread.Worksheet, cfg: Config) -> List[BuyCandidate]:
@@ -942,7 +980,7 @@ def append_entry_log_row(entry_log_ws: Optional[gspread.Worksheet], row: Sequenc
 
 
 # -----------------------------
-# Sector / correlated-risk concentration helpers
+# Sector auto-resolution / concentration helpers
 # -----------------------------
 
 
@@ -980,21 +1018,13 @@ def count_today_successful_entries(
     entry_log_ws: Optional[gspread.Worksheet],
     cfg: Config,
 ) -> int:
-    """Count successful Buyer entries for the current New York trading date.
-
-    The count is reconstructed from Buyer Entry Log on every cycle so Railway
-    restarts do not reset the Recovery Mode daily limit. Failed submissions do
-    not count. When the alpaca_paper column is present, rows from the other
-    account mode are ignored.
-    """
+    """Count successful Buyer entries for the current New York trading date."""
     if entry_log_ws is None:
         return 0
 
     try:
         values = entry_log_ws.get_all_values()
     except Exception as exc:
-        # Fail closed for Recovery Mode. An unreadable log must not silently
-        # reset the daily allowance and permit repeated entries after restarts.
         log.warning(
             "Could not read Buyer Entry Log for Recovery Mode daily counter; "
             "treating daily allowance as exhausted err=%s",
@@ -1036,83 +1066,464 @@ def count_today_successful_entries(
         paper_value = cell("alpaca_paper").strip()
         if paper_value and cell_is_true(paper_value) != cfg.alpaca_paper:
             continue
-
         successful_entries += 1
 
     return successful_entries
 
 
-def read_symbol_risk_map(
-    risk_map_ws: gspread.Worksheet,
-) -> Dict[str, SymbolClassification]:
-    values = risk_map_ws.get_all_values()
+SECTOR_NORMALIZATION = {
+    "basic materials": "Materials",
+    "materials": "Materials",
+    "communication services": "Communication Services",
+    "communications": "Communication Services",
+    "consumer cyclical": "Consumer Discretionary",
+    "consumer discretionary": "Consumer Discretionary",
+    "consumer defensive": "Consumer Staples",
+    "consumer staples": "Consumer Staples",
+    "energy": "Energy",
+    "financial services": "Financials",
+    "financials": "Financials",
+    "healthcare": "Health Care",
+    "health care": "Health Care",
+    "industrials": "Industrials",
+    "real estate": "Real Estate",
+    "technology": "Technology",
+    "utilities": "Utilities",
+}
+
+
+def normalize_sector(value: Any) -> str:
+    label = normalize_bucket_label(value)
+    if not label:
+        return ""
+    return SECTOR_NORMALIZATION.get(label.casefold(), label)
+
+
+def sector_from_fund_name(
+    name: str, symbol: str = "", *, force_fund: bool = False
+) -> str:
+    """Classify focused funds from their product name; broad funds stay separate.
+
+    Name heuristics are intentionally limited to funds and special securities.
+    Guessing a normal company's sector from its legal name is too error-prone.
+    """
+    text = f"{symbol} {name}".casefold()
+    if "cvr" in text or "contingent value" in text:
+        return "Special Situations"
+
+    is_fund_name = bool(
+        re.search(r"\b(etf|fund|portfolio|index|shares|trust)\b", text, flags=re.IGNORECASE)
+    )
+    if not force_fund and not is_fund_name:
+        return ""
+
+    rules = [
+        ("Fixed Income", r"\b(bond|treasury|fixed income|municipal|muni|high yield|income fund)\b"),
+        ("Financials", r"\b(bank|banks|banking|financial|insurance|fintech|capital markets)\b"),
+        ("Health Care", r"\b(health|healthcare|biotech|biotechnology|pharma|pharmaceutical|medical)\b"),
+        ("Technology", r"\b(technology|semiconductor|software|cybersecurity|cloud|internet|digital)\b"),
+        ("Energy", r"\b(energy|oil|gas|petroleum|uranium|solar|clean energy)\b"),
+        ("Industrials", r"\b(industrial|aerospace|defense|transportation|railroad|infrastructure)\b"),
+        ("Materials", r"\b(materials|metals|mining|gold|silver|copper|lithium|steel)\b"),
+        ("Real Estate", r"\b(real estate|reit|property)\b"),
+        ("Utilities", r"\b(utility|utilities)\b"),
+        ("Consumer Staples", r"\b(consumer staples|food|beverage|household products)\b"),
+        ("Consumer Discretionary", r"\b(consumer discretionary|retail|travel|leisure|automotive)\b"),
+        ("Communication Services", r"\b(communication|telecom|media|entertainment)\b"),
+    ]
+    for sector, pattern in rules:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            return sector
+
+    return "Broad Market ETF"
+
+
+def read_sector_cache(sector_cache_ws: gspread.Worksheet) -> Dict[str, SectorCacheEntry]:
+    values = sector_cache_ws.get_all_values()
     if not values:
         return {}
-
     headers = [str(value).strip().lower() for value in values[0]]
-    try:
-        symbol_idx = headers.index("symbol")
-        sector_idx = headers.index("sector")
-        group_idx = headers.index("risk_group")
-    except ValueError as exc:
+    required = set(SECTOR_CACHE_HEADERS)
+    if not required.issubset(set(headers)):
         raise RuntimeError(
-            "Symbol Risk Map must have headers: symbol, sector, risk_group"
-        ) from exc
-
-    result: Dict[str, SymbolClassification] = {}
-    for row in values[1:]:
-        symbol = clean_symbol(row[symbol_idx] if symbol_idx < len(row) else "")
-        sector = normalize_bucket_label(row[sector_idx] if sector_idx < len(row) else "")
-        risk_group = normalize_bucket_label(row[group_idx] if group_idx < len(row) else "")
-        if not symbol or not sector or not risk_group:
+            "Symbol Sector Cache must have headers: " + ", ".join(SECTOR_CACHE_HEADERS)
+        )
+    idx = {name: headers.index(name) for name in SECTOR_CACHE_HEADERS}
+    result: Dict[str, SectorCacheEntry] = {}
+    for row_num, row in enumerate(values[1:], start=2):
+        def cell(name: str) -> str:
+            col = idx[name]
+            return row[col] if col < len(row) else ""
+        symbol = clean_symbol(cell("symbol"))
+        if not symbol:
             continue
-        result[symbol] = SymbolClassification(symbol=symbol, sector=sector, risk_group=risk_group)
+        result[symbol] = SectorCacheEntry(
+            symbol=symbol,
+            sector=normalize_sector(cell("sector")),
+            source=normalize_bucket_label(cell("source")),
+            resolved_at=str(cell("resolved_at") or "").strip(),
+            last_checked_at=str(cell("last_checked_at") or "").strip(),
+            asset_name=normalize_bucket_label(cell("asset_name")),
+            manual_override=cell_is_true(cell("manual_override")),
+            last_error=str(cell("last_error") or "").strip(),
+            row_num=row_num,
+        )
     return result
 
 
-def classification_for_symbol(
+def sector_cache_row(entry: SectorCacheEntry) -> List[Any]:
+    return [
+        entry.symbol,
+        entry.sector,
+        entry.source,
+        entry.resolved_at,
+        entry.last_checked_at,
+        entry.asset_name,
+        entry.manual_override,
+        entry.last_error,
+    ]
+
+
+def upsert_sector_cache_entries(
+    sector_cache_ws: gspread.Worksheet,
+    cache: Dict[str, SectorCacheEntry],
+    updates: Sequence[SectorCacheEntry],
+) -> None:
+    if not updates:
+        return
+    new_rows: List[List[Any]] = []
+    for entry in updates:
+        existing = cache.get(entry.symbol)
+        row = sector_cache_row(entry)
+        if existing and existing.row_num > 0:
+            sector_cache_ws.update(f"A{existing.row_num}:H{existing.row_num}", [row])
+            saved = SectorCacheEntry(**{**entry.__dict__, "row_num": existing.row_num})
+        else:
+            new_rows.append(row)
+            saved = entry
+        cache[entry.symbol] = saved
+    if new_rows:
+        try:
+            sector_cache_ws.append_rows(new_rows, value_input_option="USER_ENTERED")
+        except AttributeError:
+            for row in new_rows:
+                sector_cache_ws.append_row(row, value_input_option="USER_ENTERED")
+        # Re-read to capture row numbers for subsequent updates in this process.
+        cache.clear()
+        cache.update(read_sector_cache(sector_cache_ws))
+
+
+def read_legacy_sector_map(
+    legacy_ws: Optional[gspread.Worksheet],
+) -> Dict[str, SectorClassification]:
+    if legacy_ws is None:
+        return {}
+    try:
+        values = legacy_ws.get_all_values()
+    except Exception as exc:
+        log.warning("Could not read legacy Symbol Risk Map for sector seeding: %s", exc)
+        return {}
+    if not values:
+        return {}
+    headers = [str(value).strip().lower() for value in values[0]]
+    if "symbol" not in headers or "sector" not in headers:
+        return {}
+    symbol_idx = headers.index("symbol")
+    sector_idx = headers.index("sector")
+    result: Dict[str, SectorClassification] = {}
+    for row in values[1:]:
+        symbol = clean_symbol(row[symbol_idx] if symbol_idx < len(row) else "")
+        sector = normalize_sector(row[sector_idx] if sector_idx < len(row) else "")
+        if symbol and sector:
+            result[symbol] = SectorClassification(symbol=symbol, sector=sector, source="legacy_map")
+    return result
+
+
+def cache_entry_is_fresh(entry: SectorCacheEntry, cfg: Config) -> bool:
+    if entry.manual_override and entry.sector:
+        return True
+    resolved = parse_iso_datetime(entry.resolved_at)
+    if resolved is None:
+        return False
+    if resolved.tzinfo is None:
+        resolved = resolved.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - resolved <= timedelta(days=cfg.sector_cache_ttl_days)
+
+
+def unresolved_retry_due(entry: Optional[SectorCacheEntry], cfg: Config) -> bool:
+    if entry is None:
+        return True
+    attempted = parse_iso_datetime(entry.last_checked_at or entry.resolved_at)
+    if attempted is None:
+        return True
+    if attempted.tzinfo is None:
+        attempted = attempted.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - attempted).total_seconds() >= cfg.sector_lookup_retry_seconds
+
+
+def external_get_json(
+    session: requests.Session,
+    url: str,
+    cfg: Config,
+    *,
+    params: Dict[str, Any],
+) -> Any:
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, max(1, cfg.request_retries) + 1):
+        try:
+            resp = session.get(
+                url,
+                params=params,
+                headers={"Accept": "application/json", "User-Agent": f"AlpacaScoreBuyer/{APP_VERSION}"},
+                timeout=cfg.request_timeout_seconds,
+            )
+            if resp.status_code == 429 and attempt < cfg.request_retries:
+                time.sleep(cfg.rate_limit_sleep_seconds)
+                continue
+            if 500 <= resp.status_code < 600 and attempt < cfg.request_retries:
+                time.sleep(min(2 ** attempt, 30))
+                continue
+            if resp.status_code >= 400:
+                body = (resp.text or "").strip().replace("\n", " ")[: cfg.error_body_max_chars]
+                raise RuntimeError(f"external GET status={resp.status_code} body={body}")
+            return resp.json() if resp.text else None
+        except Exception as exc:
+            last_exc = exc
+            if attempt < cfg.request_retries:
+                time.sleep(min(2 ** attempt, 30))
+                continue
+    raise RuntimeError(f"external GET failed after {cfg.request_retries} attempts: {last_exc}")
+
+
+def fetch_fmp_sector(
+    session: requests.Session,
     symbol: str,
-    risk_map: Dict[str, SymbolClassification],
     cfg: Config,
-) -> Optional[SymbolClassification]:
-    classification = risk_map.get(clean_symbol(symbol))
-    if classification is not None:
-        return classification
-    if cfg.unknown_classification_policy == "bucket":
-        return SymbolClassification(
-            symbol=clean_symbol(symbol),
-            sector="Unclassified",
-            risk_group="Unclassified",
+) -> Tuple[str, str, str]:
+    if not cfg.fmp_api_key:
+        raise RuntimeError("FMP_API_KEY is not configured")
+    payload = external_get_json(
+        session,
+        cfg.fmp_profile_url,
+        cfg,
+        params={"symbol": symbol, "apikey": cfg.fmp_api_key},
+    )
+    if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
+        raise RuntimeError("FMP profile returned no company profile")
+    profile = payload[0]
+    name = normalize_bucket_label(profile.get("companyName") or profile.get("name") or "")
+    sector = normalize_sector(profile.get("sector"))
+    is_fund = cell_is_true(profile.get("isEtf")) or cell_is_true(profile.get("isFund"))
+    if is_fund:
+        # Focused ETFs should count against their economic sector; broad and
+        # fixed-income funds receive their own stable buckets.
+        heuristic_sector = sector_from_fund_name(name, symbol, force_fund=is_fund)
+        if heuristic_sector:
+            sector = heuristic_sector
+    return sector, name, "fmp"
+
+
+def resolve_single_sector(
+    session: requests.Session,
+    symbol: str,
+    cfg: Config,
+) -> SectorCacheEntry:
+    resolved_at = now_iso()
+    errors: List[str] = []
+    asset_name_value = ""
+
+    if cfg.auto_sector_enabled and cfg.fmp_api_key:
+        try:
+            sector, profile_name, source = fetch_fmp_sector(session, symbol, cfg)
+            if sector:
+                return SectorCacheEntry(
+                    symbol=symbol,
+                    sector=sector,
+                    source=source,
+                    resolved_at=resolved_at,
+                    last_checked_at=resolved_at,
+                    asset_name=profile_name,
+                    manual_override=False,
+                    last_error="",
+                )
+            asset_name_value = profile_name
+            errors.append("FMP profile had no sector")
+        except Exception as exc:
+            errors.append(f"fmp:{exc}")
+
+    # Alpaca does not provide a company sector, but its product name is useful
+    # for focused ETFs, fixed-income funds, CVRs, and other special products.
+    try:
+        asset = get_asset(session, cfg, symbol)
+        asset_name_value = asset_name(asset) or asset_name_value
+        heuristic_sector = sector_from_fund_name(asset_name_value, symbol)
+        if heuristic_sector:
+            return SectorCacheEntry(
+                symbol=symbol,
+                sector=heuristic_sector,
+                source="asset_name_heuristic",
+                resolved_at=resolved_at,
+                last_checked_at=resolved_at,
+                asset_name=asset_name_value,
+                manual_override=False,
+                last_error=";".join(errors),
+            )
+    except Exception as exc:
+        errors.append(f"alpaca_asset:{exc}")
+
+    if not cfg.auto_sector_enabled:
+        errors.append("auto_sector_disabled")
+    elif not cfg.fmp_api_key:
+        errors.append("FMP_API_KEY_not_configured")
+
+    return SectorCacheEntry(
+        symbol=symbol,
+        sector="",
+        source="unresolved",
+        resolved_at="",
+        last_checked_at=resolved_at,
+        asset_name=asset_name_value,
+        manual_override=False,
+        last_error=";".join(errors)[:500],
+    )
+
+
+def resolve_sector_map(
+    session: requests.Session,
+    symbols_in_priority_order: Sequence[str],
+    sector_cache_ws: gspread.Worksheet,
+    legacy_ws: Optional[gspread.Worksheet],
+    cfg: Config,
+) -> Tuple[Dict[str, SectorClassification], Dict[str, SectorCacheEntry], SectorResolutionSummary]:
+    cache = read_sector_cache(sector_cache_ws)
+    updates: List[SectorCacheEntry] = []
+
+    # One-time-compatible migration: use the existing Symbol Risk Map's sector
+    # column as a seed, without reading or preserving risk_group.
+    legacy = read_legacy_sector_map(legacy_ws)
+    for symbol, classification in legacy.items():
+        if symbol not in cache:
+            updates.append(
+                SectorCacheEntry(
+                    symbol=symbol,
+                    sector=classification.sector,
+                    source="legacy_map",
+                    resolved_at="",
+                    last_checked_at="",
+                    asset_name="",
+                    manual_override=False,
+                    last_error="",
+                )
+            )
+    upsert_sector_cache_entries(sector_cache_ws, cache, updates)
+
+    unique_symbols: List[str] = []
+    seen: Set[str] = set()
+    for raw in symbols_in_priority_order:
+        symbol = clean_symbol(raw)
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            unique_symbols.append(symbol)
+
+    cache_hits = 0
+    stale_cache_used = 0
+    auto_resolved = 0
+    provider_errors = 0
+    lookups_attempted = 0
+    lookup_updates: List[SectorCacheEntry] = []
+    result: Dict[str, SectorClassification] = {}
+
+    for symbol in unique_symbols:
+        entry = cache.get(symbol)
+        if entry and entry.sector:
+            result[symbol] = SectorClassification(
+                symbol=symbol,
+                sector=entry.sector,
+                source=entry.source,
+                resolved_at=entry.resolved_at,
+                asset_name=entry.asset_name,
+            )
+            if cache_entry_is_fresh(entry, cfg):
+                cache_hits += 1
+                continue
+            stale_cache_used += 1
+
+        should_lookup = (
+            cfg.auto_sector_enabled
+            and lookups_attempted < cfg.sector_lookup_max_per_cycle
+            and unresolved_retry_due(entry, cfg)
+            and not (entry and entry.manual_override)
         )
-    return None
+        if not should_lookup:
+            continue
+
+        lookups_attempted += 1
+        resolved = resolve_single_sector(session, symbol, cfg)
+        if resolved.sector:
+            lookup_updates.append(resolved)
+            result[symbol] = SectorClassification(
+                symbol=symbol,
+                sector=resolved.sector,
+                source=resolved.source,
+                resolved_at=resolved.resolved_at,
+                asset_name=resolved.asset_name,
+            )
+            auto_resolved += 1
+        else:
+            provider_errors += 1
+            if entry and entry.sector:
+                # A provider outage must not erase a previously valid sector.
+                lookup_updates.append(
+                    SectorCacheEntry(
+                        symbol=entry.symbol,
+                        sector=entry.sector,
+                        source=entry.source,
+                        resolved_at=entry.resolved_at,
+                        last_checked_at=resolved.last_checked_at,
+                        asset_name=entry.asset_name or resolved.asset_name,
+                        manual_override=entry.manual_override,
+                        last_error=resolved.last_error,
+                        row_num=entry.row_num,
+                    )
+                )
+            else:
+                lookup_updates.append(resolved)
+
+    upsert_sector_cache_entries(sector_cache_ws, cache, lookup_updates)
+    unresolved = sum(1 for symbol in unique_symbols if symbol not in result)
+    return result, cache, SectorResolutionSummary(
+        cache_hits=cache_hits,
+        stale_cache_used=stale_cache_used,
+        auto_resolved=auto_resolved,
+        unresolved=unresolved,
+        provider_errors=provider_errors,
+        lookups_attempted=lookups_attempted,
+    )
 
 
-def read_today_successful_entries(
+def read_today_successful_sector_entries(
     entry_log_ws: Optional[gspread.Worksheet],
-    risk_map: Dict[str, SymbolClassification],
+    sector_map: Dict[str, SectorClassification],
     cfg: Config,
-) -> Tuple[CounterType[str], CounterType[str], CounterType[str], CounterType[str]]:
+) -> Tuple[CounterType[str], CounterType[str]]:
     sector_entries: CounterType[str] = Counter()
-    group_entries: CounterType[str] = Counter()
     sector_notional: CounterType[str] = Counter()
-    group_notional: CounterType[str] = Counter()
     if entry_log_ws is None:
-        return sector_entries, group_entries, sector_notional, group_notional
-
+        return sector_entries, sector_notional
     try:
         values = entry_log_ws.get_all_values()
     except Exception as exc:
-        log.warning("Could not read Buyer Entry Log for daily concentration counters: %s", exc)
-        return sector_entries, group_entries, sector_notional, group_notional
+        log.warning("Could not read Buyer Entry Log for daily sector counters: %s", exc)
+        return sector_entries, sector_notional
     if len(values) < 2:
-        return sector_entries, group_entries, sector_notional, group_notional
+        return sector_entries, sector_notional
 
-    headers = [str(value).strip() for value in values[0]]
+    headers = [str(value).strip().lower() for value in values[0]]
     header_idx = {name: idx for idx, name in enumerate(headers)}
     required = {"timestamp", "symbol", "filled_or_partial", "final_notional"}
     if not required.issubset(header_idx):
-        log.warning("Buyer Entry Log is missing fields needed for daily concentration counters")
-        return sector_entries, group_entries, sector_notional, group_notional
+        log.warning("Buyer Entry Log is missing fields needed for daily sector counters")
+        return sector_entries, sector_notional
 
     tz = market_timezone(cfg)
     today = datetime.now(tz).date()
@@ -1120,93 +1531,65 @@ def read_today_successful_entries(
         def cell(name: str) -> str:
             idx = header_idx.get(name)
             return row[idx] if idx is not None and idx < len(row) else ""
-
         timestamp = parse_iso_datetime(cell("timestamp"))
         if timestamp is None:
             continue
         if timestamp.tzinfo is None:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
-        if timestamp.astimezone(tz).date() != today:
+        if timestamp.astimezone(tz).date() != today or not cell_is_true(cell("filled_or_partial")):
             continue
-        if not cell_is_true(cell("filled_or_partial")):
-            continue
-
         symbol = clean_symbol(cell("symbol"))
-        classification = risk_map.get(symbol)
-        sector = normalize_bucket_label(cell("sector"))
-        risk_group = normalize_bucket_label(cell("risk_group"))
-        if not sector and classification:
-            sector = classification.sector
-        if not risk_group and classification:
-            risk_group = classification.risk_group
-        if not sector or not risk_group:
+        sector = normalize_sector(cell("sector"))
+        if not sector and symbol in sector_map:
+            sector = sector_map[symbol].sector
+        if not sector:
             continue
-
-        notional = max(0.0, to_float(cell("final_notional"), default=0.0))
-        sector_key = bucket_key(sector)
-        group_key = bucket_key(risk_group)
-        sector_entries[sector_key] += 1
-        group_entries[group_key] += 1
-        sector_notional[sector_key] += notional
-        group_notional[group_key] += notional
-
-    return sector_entries, group_entries, sector_notional, group_notional
+        key = bucket_key(sector)
+        sector_entries[key] += 1
+        sector_notional[key] += max(0.0, to_float(cell("final_notional"), default=0.0))
+    return sector_entries, sector_notional
 
 
-def get_or_create_bucket(
-    buckets: Dict[str, BucketStats],
-    label: str,
-) -> BucketStats:
+def get_or_create_bucket(buckets: Dict[str, BucketStats], label: str) -> BucketStats:
     key = bucket_key(label)
     bucket = buckets.get(key)
     if bucket is None:
-        bucket = BucketStats(label=normalize_bucket_label(label))
+        bucket = BucketStats(label=normalize_sector(label))
         buckets[key] = bucket
     return bucket
 
 
 def build_concentration_state(
     positions: Sequence[PositionSnapshot],
-    risk_map: Dict[str, SymbolClassification],
+    sector_map: Dict[str, SectorClassification],
     entry_log_ws: Optional[gspread.Worksheet],
     cfg: Config,
 ) -> ConcentrationState:
-    sector_entries, group_entries, sector_notional, group_notional = read_today_successful_entries(
-        entry_log_ws, risk_map, cfg
+    sector_entries, sector_notional = read_today_successful_sector_entries(
+        entry_log_ws, sector_map, cfg
     )
     state = ConcentrationState(
         sector_stats={},
-        group_stats={},
         daily_sector_entries=sector_entries,
-        daily_group_entries=group_entries,
         daily_sector_notional=sector_notional,
-        daily_group_notional=group_notional,
         unknown_position_symbols=set(),
     )
-
     for position in positions:
-        classification = classification_for_symbol(position.symbol, risk_map, cfg)
+        classification = sector_map.get(position.symbol)
         if classification is None:
             state.unknown_position_symbols.add(position.symbol)
             continue
-
         market_value = max(0.0, position.market_value)
         cost_basis = market_value - position.unrealized_pl
         if cost_basis <= 0:
             cost_basis = market_value
-        is_red = position.unrealized_pl < 0 or position.unrealized_plpc < 0
-
-        for bucket in (
-            get_or_create_bucket(state.sector_stats, classification.sector),
-            get_or_create_bucket(state.group_stats, classification.risk_group),
-        ):
-            bucket.position_count += 1
-            bucket.market_value += market_value
-            bucket.unrealized_pl += position.unrealized_pl
-            bucket.cost_basis += max(0.0, cost_basis)
-            if is_red:
-                bucket.red_position_count += 1
-
+        bucket = get_or_create_bucket(state.sector_stats, classification.sector)
+        bucket.position_count += 1
+        bucket.market_value += market_value
+        bucket.unrealized_pl += position.unrealized_pl
+        bucket.cost_basis += max(0.0, cost_basis)
+        if position.unrealized_pl < 0 or position.unrealized_plpc < 0:
+            bucket.red_position_count += 1
     return state
 
 
@@ -1221,170 +1604,106 @@ def bucket_is_stressed(bucket: BucketStats, cfg: Config) -> bool:
 
 
 def evaluate_concentration(
-    classification: SymbolClassification,
+    classification: SectorClassification,
     concentration: ConcentrationState,
     equity: float,
     proposed_notional: float,
     cfg: Config,
 ) -> ConcentrationCheck:
-    sector_key = bucket_key(classification.sector)
-    group_key = bucket_key(classification.risk_group)
-    sector_bucket = concentration.sector_stats.get(
-        sector_key, BucketStats(label=classification.sector)
+    key = bucket_key(classification.sector)
+    bucket = concentration.sector_stats.get(key, BucketStats(label=classification.sector))
+    exposure_before = positive_ratio(bucket.market_value, equity)
+    daily_notional_before = positive_ratio(
+        float(concentration.daily_sector_notional.get(key, 0.0)), equity
     )
-    group_bucket = concentration.group_stats.get(
-        group_key, BucketStats(label=classification.risk_group)
-    )
-
-    sector_exposure_before = positive_ratio(sector_bucket.market_value, equity)
-    group_exposure_before = positive_ratio(group_bucket.market_value, equity)
-    sector_daily_notional_before = positive_ratio(
-        float(concentration.daily_sector_notional.get(sector_key, 0.0)), equity
-    )
-    group_daily_notional_before = positive_ratio(
-        float(concentration.daily_group_notional.get(group_key, 0.0)), equity
-    )
-    sector_entries_today = int(concentration.daily_sector_entries.get(sector_key, 0))
-    group_entries_today = int(concentration.daily_group_entries.get(group_key, 0))
-    sector_stressed = bucket_is_stressed(sector_bucket, cfg)
-    group_stressed = bucket_is_stressed(group_bucket, cfg)
+    entries_today = int(concentration.daily_sector_entries.get(key, 0))
+    stressed = bucket_is_stressed(bucket, cfg)
 
     reason = "concentration_gate_disabled"
     allowed = True
     if cfg.concentration_gate_enabled:
         reason = "concentration_ok"
-        if cfg.max_new_per_sector_per_day > 0 and sector_entries_today >= cfg.max_new_per_sector_per_day:
+        if cfg.max_new_per_sector_per_day > 0 and entries_today >= cfg.max_new_per_sector_per_day:
             allowed = False
             reason = "sector_daily_limit"
-        elif cfg.max_new_per_risk_group_per_day > 0 and group_entries_today >= cfg.max_new_per_risk_group_per_day:
-            allowed = False
-            reason = "group_daily_limit"
-        elif cfg.max_open_positions_per_sector > 0 and sector_bucket.position_count >= cfg.max_open_positions_per_sector:
+        elif cfg.max_open_positions_per_sector > 0 and bucket.position_count >= cfg.max_open_positions_per_sector:
             allowed = False
             reason = "sector_position_limit"
-        elif cfg.max_open_positions_per_risk_group > 0 and group_bucket.position_count >= cfg.max_open_positions_per_risk_group:
-            allowed = False
-            reason = "group_position_limit"
-        elif sector_stressed:
+        elif stressed:
             allowed = False
             reason = "sector_stress"
-        elif group_stressed:
-            allowed = False
-            reason = "group_stress"
         elif equity <= 0:
             allowed = False
             reason = "concentration_equity_invalid"
         else:
-            projected_sector_exposure = positive_ratio(
-                sector_bucket.market_value + max(0.0, proposed_notional), equity
+            projected_exposure = positive_ratio(
+                bucket.market_value + max(0.0, proposed_notional), equity
             )
-            projected_group_exposure = positive_ratio(
-                group_bucket.market_value + max(0.0, proposed_notional), equity
-            )
-            projected_sector_daily_notional = positive_ratio(
-                float(concentration.daily_sector_notional.get(sector_key, 0.0))
+            projected_daily_notional = positive_ratio(
+                float(concentration.daily_sector_notional.get(key, 0.0))
                 + max(0.0, proposed_notional),
                 equity,
             )
-            projected_group_daily_notional = positive_ratio(
-                float(concentration.daily_group_notional.get(group_key, 0.0))
-                + max(0.0, proposed_notional),
-                equity,
-            )
-            if cfg.max_sector_exposure_pct > 0 and projected_sector_exposure > cfg.max_sector_exposure_pct:
+            if cfg.max_sector_exposure_pct > 0 and projected_exposure > cfg.max_sector_exposure_pct:
                 allowed = False
                 reason = "sector_exposure"
-            elif cfg.max_risk_group_exposure_pct > 0 and projected_group_exposure > cfg.max_risk_group_exposure_pct:
-                allowed = False
-                reason = "group_exposure"
             elif (
                 cfg.max_daily_sector_notional_pct > 0
-                and projected_sector_daily_notional > cfg.max_daily_sector_notional_pct
+                and projected_daily_notional > cfg.max_daily_sector_notional_pct
             ):
                 allowed = False
                 reason = "sector_daily_notional"
-            elif (
-                cfg.max_daily_risk_group_notional_pct > 0
-                and projected_group_daily_notional > cfg.max_daily_risk_group_notional_pct
-            ):
-                allowed = False
-                reason = "group_daily_notional"
 
     return ConcentrationCheck(
         allowed=allowed,
         reason=reason,
         sector=classification.sector,
-        risk_group=classification.risk_group,
-        sector_position_count_before=sector_bucket.position_count,
-        group_position_count_before=group_bucket.position_count,
-        sector_exposure_pct_before=sector_exposure_before,
-        group_exposure_pct_before=group_exposure_before,
-        sector_entries_today=sector_entries_today,
-        group_entries_today=group_entries_today,
-        sector_daily_notional_pct_before=sector_daily_notional_before,
-        group_daily_notional_pct_before=group_daily_notional_before,
-        sector_stressed=sector_stressed,
-        group_stressed=group_stressed,
+        sector_position_count_before=bucket.position_count,
+        sector_exposure_pct_before=exposure_before,
+        sector_entries_today=entries_today,
+        sector_daily_notional_pct_before=daily_notional_before,
+        sector_stressed=stressed,
     )
 
 
 def apply_filled_entry_to_concentration(
     concentration: ConcentrationState,
-    classification: SymbolClassification,
+    classification: SectorClassification,
     notional: float,
 ) -> None:
-    sector_key = bucket_key(classification.sector)
-    group_key = bucket_key(classification.risk_group)
-    for bucket in (
-        get_or_create_bucket(concentration.sector_stats, classification.sector),
-        get_or_create_bucket(concentration.group_stats, classification.risk_group),
-    ):
-        bucket.position_count += 1
-        bucket.market_value += max(0.0, notional)
-        bucket.cost_basis += max(0.0, notional)
-
-    concentration.daily_sector_entries[sector_key] += 1
-    concentration.daily_group_entries[group_key] += 1
-    concentration.daily_sector_notional[sector_key] += max(0.0, notional)
-    concentration.daily_group_notional[group_key] += max(0.0, notional)
+    key = bucket_key(classification.sector)
+    bucket = get_or_create_bucket(concentration.sector_stats, classification.sector)
+    bucket.position_count += 1
+    bucket.market_value += max(0.0, notional)
+    bucket.cost_basis += max(0.0, notional)
+    concentration.daily_sector_entries[key] += 1
+    concentration.daily_sector_notional[key] += max(0.0, notional)
 
 
 def concentration_skip_counter_name(reason: str) -> Optional[str]:
     return {
         "sector_daily_limit": "skipped_sector_daily_limit",
-        "group_daily_limit": "skipped_group_daily_limit",
         "sector_position_limit": "skipped_sector_position_limit",
-        "group_position_limit": "skipped_group_position_limit",
         "sector_exposure": "skipped_sector_exposure",
-        "group_exposure": "skipped_group_exposure",
         "sector_daily_notional": "skipped_sector_daily_notional",
-        "group_daily_notional": "skipped_group_daily_notional",
         "sector_stress": "skipped_sector_stress",
-        "group_stress": "skipped_group_stress",
     }.get(reason)
 
 
 def set_concentration_state(
     concentration: ConcentrationState,
-    risk_map_size: int,
+    sector_cache_size: int,
     equity: float,
 ) -> None:
     largest_sector = max(
         concentration.sector_stats.values(), key=lambda item: item.market_value, default=None
     )
-    largest_group = max(
-        concentration.group_stats.values(), key=lambda item: item.market_value, default=None
-    )
     set_state(
-        last_risk_map_symbols=risk_map_size,
-        last_unknown_position_symbols=sorted(concentration.unknown_position_symbols),
+        last_sector_cache_symbols=sector_cache_size,
+        last_unresolved_position_symbols=sorted(concentration.unknown_position_symbols),
         last_largest_sector=largest_sector.label if largest_sector else None,
         last_largest_sector_exposure_pct=(
             round(positive_ratio(largest_sector.market_value, equity), 6) if largest_sector else 0.0
-        ),
-        last_largest_risk_group=largest_group.label if largest_group else None,
-        last_largest_risk_group_exposure_pct=(
-            round(positive_ratio(largest_group.market_value, equity), 6) if largest_group else 0.0
         ),
     )
 
@@ -2181,7 +2500,8 @@ def process_cycle(
     session: requests.Session,
     ws: gspread.Worksheet,
     entry_log_ws: Optional[gspread.Worksheet],
-    risk_map_ws: gspread.Worksheet,
+    sector_cache_ws: gspread.Worksheet,
+    legacy_risk_map_ws: Optional[gspread.Worksheet],
     cfg: Config,
 ) -> None:
     set_state(
@@ -2231,10 +2551,34 @@ def process_cycle(
     )
     set_risk_state(risk)
 
-    risk_map = read_symbol_risk_map(risk_map_ws)
-    concentration = build_concentration_state(position_snapshots, risk_map, entry_log_ws, cfg)
-    set_concentration_state(concentration, len(risk_map), risk.equity)
-    set_state(last_concentration_gate_block_reason=None)
+    priority_symbols = (
+        [p.symbol for p in position_snapshots]
+        + sorted(open_orders.all_symbols)
+        + [candidate.symbol for candidate in candidates]
+    )
+    sector_map, sector_cache, sector_resolution = resolve_sector_map(
+        session,
+        priority_symbols,
+        sector_cache_ws,
+        legacy_risk_map_ws,
+        cfg,
+    )
+    concentration = build_concentration_state(
+        position_snapshots, sector_map, entry_log_ws, cfg
+    )
+    set_concentration_state(concentration, len(sector_cache), risk.equity)
+    unresolved_candidates = sorted(
+        candidate.symbol for candidate in candidates if candidate.symbol not in sector_map
+    )
+    set_state(
+        last_concentration_gate_block_reason=None,
+        last_unresolved_candidate_symbols=unresolved_candidates,
+        last_sector_cache_hits=sector_resolution.cache_hits,
+        last_sector_stale_cache_used=sector_resolution.stale_cache_used,
+        last_sector_auto_resolved=sector_resolution.auto_resolved,
+        last_sector_provider_errors=sector_resolution.provider_errors,
+        last_sector_lookups_attempted=sector_resolution.lookups_attempted,
+    )
 
     log.info(
         "Risk gate mode=%s reasons=%s equity=%.2f cash_pct=%.2f%% exposure_pct=%.2f%% margin_use_pct=%.2f%% drawdown_pct=%.2f%% positions=%d open_orders=%d open_buy_orders=%d open_sell_orders=%d red/green=%d/%d available_slots=%d max_new_orders_this_cycle=%d order_fraction_multiplier=%.2f recovery_entries_today=%d recovery_entries_remaining=%d",
@@ -2258,16 +2602,21 @@ def process_cycle(
         risk.recovery_entries_remaining,
     )
     log.info(
-        "Concentration gate enabled=%s risk_map_symbols=%d unknown_policy=%s unknown_positions=%s",
+        "Sector gate enabled=%s cache_symbols=%d auto_sector_enabled=%s fmp_configured=%s "
+        "cache_hits=%d stale_used=%d auto_resolved=%d unresolved=%d provider_errors=%d "
+        "unresolved_positions=%s unresolved_candidates=%s",
         cfg.concentration_gate_enabled,
-        len(risk_map),
-        cfg.unknown_classification_policy,
+        len(sector_cache),
+        cfg.auto_sector_enabled,
+        bool(cfg.fmp_api_key),
+        sector_resolution.cache_hits,
+        sector_resolution.stale_cache_used,
+        sector_resolution.auto_resolved,
+        sector_resolution.unresolved,
+        sector_resolution.provider_errors,
         sorted(concentration.unknown_position_symbols),
+        unresolved_candidates,
     )
-    if cfg.concentration_gate_enabled and not risk_map and cfg.unknown_classification_policy == "skip":
-        log.warning(
-            "Concentration gate is fail-closed and Symbol Risk Map has no complete rows; all candidates will be skipped"
-        )
 
     orders_submitted = 0
     filled_or_partial = 0
@@ -2281,14 +2630,14 @@ def process_cycle(
     skipped_asset_lookup = 0
     skipped_entry_sized_below_min = 0
     skipped_reentry_guard = 0
-    skipped_unknown_classification = 0
+    skipped_unresolved_sector = 0
     concentration_skips: CounterType[str] = Counter()
     entry_log_rows = 0
     order_submit_failures = 0
     unfilled_cooldowns_set = 0
 
     def finish_cycle() -> None:
-        set_concentration_state(concentration, len(risk_map), risk.equity)
+        set_concentration_state(concentration, len(sector_cache), risk.equity)
         set_state(
             last_cycle_finished_at=now_iso(),
             last_candidates=len(candidates),
@@ -2305,17 +2654,12 @@ def process_cycle(
             last_skipped_sma200_sized_below_min=skipped_entry_sized_below_min,
             last_skipped_entry_sized_below_min=skipped_entry_sized_below_min,
             last_skipped_reentry_guard=skipped_reentry_guard,
-            last_skipped_unknown_classification=skipped_unknown_classification,
+            last_skipped_unresolved_sector=skipped_unresolved_sector,
             last_skipped_sector_daily_limit=concentration_skips["skipped_sector_daily_limit"],
-            last_skipped_group_daily_limit=concentration_skips["skipped_group_daily_limit"],
             last_skipped_sector_position_limit=concentration_skips["skipped_sector_position_limit"],
-            last_skipped_group_position_limit=concentration_skips["skipped_group_position_limit"],
             last_skipped_sector_exposure=concentration_skips["skipped_sector_exposure"],
-            last_skipped_group_exposure=concentration_skips["skipped_group_exposure"],
             last_skipped_sector_daily_notional=concentration_skips["skipped_sector_daily_notional"],
-            last_skipped_group_daily_notional=concentration_skips["skipped_group_daily_notional"],
             last_skipped_sector_stress=concentration_skips["skipped_sector_stress"],
-            last_skipped_group_stress=concentration_skips["skipped_group_stress"],
             last_entry_log_rows=entry_log_rows,
             last_order_submit_failures=order_submit_failures,
             last_unfilled_cooldowns_set=unfilled_cooldowns_set,
@@ -2330,23 +2674,6 @@ def process_cycle(
         finish_cycle()
         return
 
-    if cfg.concentration_gate_enabled and cfg.unknown_classification_policy == "skip":
-        concentration_block_reason = ""
-        if not risk_map:
-            concentration_block_reason = "risk_map_empty"
-        elif concentration.unknown_position_symbols:
-            concentration_block_reason = (
-                "unmapped_open_positions:"
-                + ",".join(sorted(concentration.unknown_position_symbols))
-            )
-        if concentration_block_reason:
-            set_state(last_concentration_gate_block_reason=concentration_block_reason)
-            log.warning(
-                "Concentration gate blocks all new buys until classification is complete reason=%s",
-                concentration_block_reason,
-            )
-            finish_cycle()
-            return
 
     recent_sell_fills = list_recent_sell_fills(session, cfg)
     if recent_sell_fills:
@@ -2396,15 +2723,13 @@ def process_cycle(
             skipped_existing += 1
             continue
 
-        classification = classification_for_symbol(symbol, risk_map, cfg)
+        classification = sector_map.get(symbol)
         if classification is None:
             log.info(
-                "Skipping %s: no complete symbol/sector/risk_group row in %r and UNKNOWN_CLASSIFICATION_POLICY=%s",
+                "Skipping %s: automatic sector resolution is unresolved; candidate only is blocked",
                 symbol,
-                cfg.risk_map_worksheet_name,
-                cfg.unknown_classification_policy,
             )
-            skipped_unknown_classification += 1
+            skipped_unresolved_sector += 1
             continue
 
         concentration_check = evaluate_concentration(
@@ -2415,19 +2740,15 @@ def process_cycle(
             if counter_name:
                 concentration_skips[counter_name] += 1
             log.info(
-                "Skipping %s: concentration reason=%s sector=%s group=%s sector_positions=%d group_positions=%d sector_entries_today=%d group_entries_today=%d sector_exposure=%.2f%% group_exposure=%.2f%% sector_stressed=%s group_stressed=%s",
+                "Skipping %s: sector concentration reason=%s sector=%s "
+                "sector_positions=%d sector_entries_today=%d sector_exposure=%.2f%% sector_stressed=%s",
                 symbol,
                 concentration_check.reason,
                 classification.sector,
-                classification.risk_group,
                 concentration_check.sector_position_count_before,
-                concentration_check.group_position_count_before,
                 concentration_check.sector_entries_today,
-                concentration_check.group_entries_today,
                 concentration_check.sector_exposure_pct_before * 100,
-                concentration_check.group_exposure_pct_before * 100,
                 concentration_check.sector_stressed,
-                concentration_check.group_stressed,
             )
             continue
 
@@ -2519,16 +2840,15 @@ def process_cycle(
             if counter_name:
                 concentration_skips[counter_name] += 1
             log.info(
-                "Skipping %s after sizing: concentration reason=%s sector=%s group=%s proposed_notional=%.2f sector_exposure_before=%.2f%% group_exposure_before=%.2f%% sector_daily_notional_before=%.2f%% group_daily_notional_before=%.2f%%",
+                "Skipping %s after sizing: sector concentration reason=%s sector=%s "
+                "proposed_notional=%.2f sector_exposure_before=%.2f%% "
+                "sector_daily_notional_before=%.2f%%",
                 symbol,
                 concentration_check.reason,
                 classification.sector,
-                classification.risk_group,
                 notional,
                 concentration_check.sector_exposure_pct_before * 100,
-                concentration_check.group_exposure_pct_before * 100,
                 concentration_check.sector_daily_notional_pct_before * 100,
-                concentration_check.group_daily_notional_pct_before * 100,
             )
             continue
 
@@ -2567,13 +2887,13 @@ def process_cycle(
             continue
 
         log.info(
-            "Buying candidate %s: score=%.4f rank_score=%.4f risk_mode=%s sector=%s risk_group=%s base_notional=%.2f adjusted_notional=%.2f entry_multiplier=%.4f sma200_multiplier=%.4f sma50_multiplier=%.4f close_vs_sma200=%s close_vs_sma50=%s sizing_reason=%s effective_fraction=%.2f%% buying_power_field=%s buying_power=%.2f close=%.4f sma_200=%.4f sma_50=%.4f reentry=%s concentration=%s",
+            "Buying candidate %s: score=%.4f rank_score=%.4f risk_mode=%s sector=%s sector_source=%s base_notional=%.2f adjusted_notional=%.2f entry_multiplier=%.4f sma200_multiplier=%.4f sma50_multiplier=%.4f close_vs_sma200=%s close_vs_sma50=%s sizing_reason=%s effective_fraction=%.2f%% buying_power_field=%s buying_power=%.2f close=%.4f sma_200=%.4f sma_50=%.4f reentry=%s concentration=%s",
             symbol,
             candidate.score,
             rank_score,
             risk.mode,
             classification.sector,
-            classification.risk_group,
+            classification.source,
             base_notional,
             notional,
             entry_sizing_multiplier,
@@ -2669,17 +2989,17 @@ def process_cycle(
                 reentry_decision,
                 APP_VERSION,
                 classification.sector,
-                classification.risk_group,
+                "",  # legacy risk_group column retained for historical alignment
                 final_concentration_check.sector_position_count_before,
-                final_concentration_check.group_position_count_before,
+                0,  # legacy group_position_count_before
                 round(final_concentration_check.sector_exposure_pct_before, 6),
-                round(final_concentration_check.group_exposure_pct_before, 6),
+                0.0,  # legacy group_exposure_pct_before
                 final_concentration_check.sector_entries_today,
-                final_concentration_check.group_entries_today,
+                0,  # legacy group_entries_today
                 round(final_concentration_check.sector_daily_notional_pct_before, 6),
-                round(final_concentration_check.group_daily_notional_pct_before, 6),
+                0.0,  # legacy group_daily_notional_pct_before
                 final_concentration_check.sector_stressed,
-                final_concentration_check.group_stressed,
+                False,  # legacy group_stressed
                 final_concentration_check.reason,
                 risk.recovery_entries_today,
                 risk.recovery_entries_remaining,
@@ -2722,7 +3042,7 @@ def process_cycle(
 
     finish_cycle()
     log.info(
-        "Cycle complete risk_mode=%s candidates=%d orders_submitted=%d filled_or_partial=%d skipped_existing=%d skipped_open_buy_order=%d skipped_open_sell_order=%d skipped_open_other_order=%d skipped_notional=%d skipped_recent_failures=%d skipped_reentry_guard=%d skipped_unknown_classification=%d concentration_skips=%s skipped_product_name_block=%d skipped_asset_lookup=%d skipped_entry_sized_below_min=%d entry_log_rows=%d order_submit_failures=%d unfilled_cooldowns_set=%d",
+        "Cycle complete risk_mode=%s candidates=%d orders_submitted=%d filled_or_partial=%d skipped_existing=%d skipped_open_buy_order=%d skipped_open_sell_order=%d skipped_open_other_order=%d skipped_notional=%d skipped_recent_failures=%d skipped_reentry_guard=%d skipped_unresolved_sector=%d concentration_skips=%s skipped_product_name_block=%d skipped_asset_lookup=%d skipped_entry_sized_below_min=%d entry_log_rows=%d order_submit_failures=%d unfilled_cooldowns_set=%d",
         risk.mode,
         len(candidates),
         orders_submitted,
@@ -2734,7 +3054,7 @@ def process_cycle(
         skipped_notional,
         skipped_recent_failures,
         skipped_reentry_guard,
-        skipped_unknown_classification,
+        skipped_unresolved_sector,
         dict(concentration_skips),
         skipped_product_name_block,
         skipped_asset_lookup,
@@ -2749,7 +3069,16 @@ def buyer_loop() -> None:
     cfg = load_config()
     set_state(started_at=now_iso())
     log.info(
-        "Buyer service started version=%s sheet_id=%s worksheet=%s range=%s buy_score=%s order_fraction=%.4f paper=%s primary_buying_power_field=buying_power regt_fallback_fraction=%.2f steps=%s cycle_sleep=%.1f extended_hours=%s market_open_check_enabled=%s order_failure_cooldown=%.0f unfilled_order_cooldown=%.0f blocked_product_name_pattern=%r skip_when_asset_name_unavailable=%s sma200_sizing_enabled=%s sma200_min_multiplier=%.2f sma200_max_reduction_distance=%.2f sma50_sizing_enabled=%s sma50_full_size_distance=%.2f sma50_max_reduction_distance=%.2f sma50_min_multiplier=%.2f risk_gate_enabled=%s position_cap_enabled=%s max_total_positions=%d red_exposure_pct=%.2f red_min_cash_pct=%.2f red_margin_use_pct=%.2f yellow_max_orders_per_cycle=%d yellow_order_fraction_multiplier=%.2f recovery_mode_enabled=%s recovery_max_exposure=%.2f recovery_min_cash=%.2f recovery_max_margin_use=%.2f recovery_max_entries_day=%d recovery_order_fraction_multiplier=%.2f rank_candidates_enabled=%s reentry_guard_enabled=%s reentry_lookback_days=%d reentry_min_discount_pct=%.2f concentration_gate_enabled=%s risk_map_worksheet=%r unknown_policy=%s max_new_sector_day=%d max_new_group_day=%d max_open_sector=%d max_open_group=%d max_sector_exposure=%.2f max_group_exposure=%.2f stress_freeze_enabled=%s entry_log_worksheet=%r",
+        "Buyer service started version=%s sheet_id=%s worksheet=%s range=%s buy_score=%s "
+        "order_fraction=%.4f paper=%s primary_buying_power_field=buying_power "
+        "regt_fallback_fraction=%.2f steps=%s cycle_sleep=%.1f extended_hours=%s "
+        "market_open_check_enabled=%s order_failure_cooldown=%.0f unfilled_order_cooldown=%.0f "
+        "risk_gate_enabled=%s position_cap_enabled=%s recovery_mode_enabled=%s "
+        "concentration_gate_enabled=%s sector_cache_worksheet=%r legacy_risk_map=%r "
+        "auto_sector_enabled=%s fmp_configured=%s sector_cache_ttl_days=%d "
+        "sector_lookup_max_per_cycle=%d max_new_sector_day=%d max_open_sector=%d "
+        "max_sector_exposure=%.2f max_daily_sector_notional=%.2f stress_freeze_enabled=%s "
+        "entry_log_worksheet=%r",
         APP_VERSION,
         cfg.google_sheet_id,
         cfg.google_worksheet_name,
@@ -2764,42 +3093,20 @@ def buyer_loop() -> None:
         cfg.market_open_check_enabled,
         cfg.order_failure_cooldown_seconds,
         cfg.unfilled_order_cooldown_seconds,
-        cfg.blocked_product_name_pattern,
-        cfg.skip_when_asset_name_unavailable,
-        cfg.sma200_sizing_enabled,
-        cfg.sma200_sizing_min_multiplier,
-        cfg.sma200_sizing_max_reduction_distance,
-        cfg.sma50_sizing_enabled,
-        cfg.sma50_sizing_full_size_distance,
-        cfg.sma50_sizing_max_reduction_distance,
-        cfg.sma50_sizing_min_multiplier,
         cfg.risk_gate_enabled,
         cfg.position_cap_enabled,
-        cfg.max_total_positions,
-        cfg.red_exposure_pct,
-        cfg.red_min_cash_pct,
-        cfg.red_margin_use_pct,
-        cfg.yellow_max_orders_per_cycle,
-        cfg.yellow_order_fraction_multiplier,
         cfg.recovery_mode_enabled,
-        cfg.recovery_max_exposure_pct,
-        cfg.recovery_min_cash_pct,
-        cfg.recovery_max_margin_use_pct,
-        cfg.recovery_max_new_entries_per_day,
-        cfg.recovery_order_fraction_multiplier,
-        cfg.rank_candidates_enabled,
-        cfg.reentry_guard_enabled,
-        cfg.reentry_lookback_days,
-        cfg.reentry_min_discount_pct,
         cfg.concentration_gate_enabled,
-        cfg.risk_map_worksheet_name,
-        cfg.unknown_classification_policy,
+        cfg.sector_cache_worksheet_name,
+        cfg.legacy_risk_map_worksheet_name,
+        cfg.auto_sector_enabled,
+        bool(cfg.fmp_api_key),
+        cfg.sector_cache_ttl_days,
+        cfg.sector_lookup_max_per_cycle,
         cfg.max_new_per_sector_per_day,
-        cfg.max_new_per_risk_group_per_day,
         cfg.max_open_positions_per_sector,
-        cfg.max_open_positions_per_risk_group,
         cfg.max_sector_exposure_pct,
-        cfg.max_risk_group_exposure_pct,
+        cfg.max_daily_sector_notional_pct,
         cfg.stress_freeze_enabled,
         cfg.entry_log_worksheet_name,
     )
@@ -2807,7 +3114,8 @@ def buyer_loop() -> None:
     gc: Optional[gspread.Client] = None
     ws: Optional[gspread.Worksheet] = None
     entry_log_ws: Optional[gspread.Worksheet] = None
-    risk_map_ws: Optional[gspread.Worksheet] = None
+    sector_cache_ws: Optional[gspread.Worksheet] = None
+    legacy_risk_map_ws: Optional[gspread.Worksheet] = None
     session = requests.Session()
 
     while not _stop_event.is_set():
@@ -2820,18 +3128,30 @@ def buyer_loop() -> None:
                 entry_log_ws = open_or_create_worksheet(
                     gc, cfg, cfg.entry_log_worksheet_name, ENTRY_LOG_HEADERS
                 )
-            if risk_map_ws is None:
-                risk_map_ws = open_or_create_worksheet(
-                    gc, cfg, cfg.risk_map_worksheet_name, RISK_MAP_HEADERS
+            if sector_cache_ws is None:
+                sector_cache_ws = open_or_create_worksheet(
+                    gc, cfg, cfg.sector_cache_worksheet_name, SECTOR_CACHE_HEADERS
                 )
-            process_cycle(session, ws, entry_log_ws, risk_map_ws, cfg)
+            if legacy_risk_map_ws is None and cfg.legacy_risk_map_worksheet_name:
+                legacy_risk_map_ws = open_optional_worksheet(
+                    gc, cfg, cfg.legacy_risk_map_worksheet_name
+                )
+            process_cycle(
+                session,
+                ws,
+                entry_log_ws,
+                sector_cache_ws,
+                legacy_risk_map_ws,
+                cfg,
+            )
         except Exception as exc:
             log.exception("Buyer loop error: %s", exc)
             set_state(last_error=str(exc))
             gc = None
             ws = None
             entry_log_ws = None
-            risk_map_ws = None
+            sector_cache_ws = None
+            legacy_risk_map_ws = None
             time.sleep(cfg.error_sleep_seconds)
 
         time.sleep(cfg.cycle_sleep_seconds)
